@@ -35,7 +35,7 @@ impl<'a> AirSensor<'a> {
         Ok(serial_number)
     }
 
-    pub async fn measure(&mut self) -> Result<(f32, f32, u32), Error> {
+    pub async fn measure(&mut self) -> Result<(f32, f32, u16), Error> {
         self.write(MEASURE_SINGLE_SHOT_COMMAND).await?;
 
         Timer::after_millis(5000).await;
@@ -44,11 +44,25 @@ impl<'a> AirSensor<'a> {
         let mut buffer = [0u8; 9];
         self.read(&mut buffer).await?;
 
-        let co2 = u16::from_be_bytes([buffer[0], buffer[1]]) as u32;
-        let temperature = u16::from_be_bytes([buffer[2], buffer[3]]) as f32 / 100.0;
-        let humidity = u16::from_be_bytes([buffer[4], buffer[5]]) as f32 / 100.0;
+        let co2 = AirSensor::convert_co2_signal(buffer[0], buffer[1]).await;
+        let temperature = AirSensor::convert_temperature_signal(buffer[3], buffer[4]).await;
+        let humidity = AirSensor::convert_humidity_signal(buffer[6], buffer[7]).await;
 
         Ok((temperature, humidity, co2))
+    }
+
+    async fn convert_co2_signal(msb: u8, lsb: u8) -> u16 {
+        u16::from_be_bytes([msb, lsb])
+    }
+
+    async fn convert_temperature_signal(msb: u8, lsb: u8) -> f32 {
+        let bytes = u16::from_be_bytes([msb, lsb]);
+        bytes as f32 * 175.0f32 / (u16::MAX as f32) - 45.0
+    }
+
+    async fn convert_humidity_signal(msb: u8, lsb: u8) -> f32 {
+        let bytes = u16::from_be_bytes([msb, lsb]);
+        bytes as f32 * 100.0 / (u16::MAX as f32)
     }
 
     pub async fn get_serial_number(&mut self) -> Result<u64, Error> {

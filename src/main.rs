@@ -63,7 +63,7 @@ bind_interrupts!(struct Irqs {
 
 enum SensorData {
     Soil(f32, u16),
-    Air(f32, f32, u32),
+    Air(f32, f32, u16),
 }
 
 enum RadioCommand {
