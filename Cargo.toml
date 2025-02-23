@@ -17,11 +17,11 @@ embassy-rp = { version = "0.3.1", features = [
     "critical-section-impl",
     "rp2040",
 ] }
-lora-phy = { git = "https://github.com/lora-rs/lora-rs.git#40926b7", features = [
+lora-phy = { git = "https://github.com/lora-rs/lora-rs.git", rev = "40926b7", features = [
     "lorawan-radio",
     "defmt-03",
 ] }
-lorawan-device = { git = "https://github.com/lora-rs/lora-rs.git#40926b7", default-features = false, features = [
+lorawan-device = { git = "https://github.com/lora-rs/lora-rs.git", rev = "40926b7", default-features = false, features = [
     "region-eu868",
     "embassy-time",
     "default-crypto",
