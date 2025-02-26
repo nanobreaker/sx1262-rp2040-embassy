@@ -9,16 +9,17 @@ mod soil_sensor;
 use air_sensor::AirSensor;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
+use embassy_rp::adc::{self, Adc, Async};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pin, Pull};
-use embassy_rp::i2c::{I2c, InterruptHandler};
+use embassy_rp::i2c::I2c;
 use embassy_rp::peripherals::{I2C0, I2C1, SPI1};
-use embassy_rp::spi::{Async, Config, Spi};
+use embassy_rp::spi::{self, Config, Spi};
 use embassy_rp::{bind_interrupts, i2c};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Delay, Timer};
+use embassy_time::{Delay, Duration, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_phy::iv::GenericSx126xInterfaceVariant;
 use lora_phy::lorawan_radio::LorawanRadio;
@@ -34,7 +35,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 type Sx1262Radio = LorawanRadio<
     Sx126x<
-        ExclusiveDevice<Spi<'static, SPI1, Async>, Output<'static>, Delay>,
+        ExclusiveDevice<Spi<'static, SPI1, spi::Async>, Output<'static>, Delay>,
         GenericSx126xInterfaceVariant<Output<'static>, Input<'static>>,
         Sx1262,
     >,
@@ -56,20 +57,28 @@ static SOIL_CTRL_CHNL: Channel<ThreadModeRawMutex, SoilSensorCommand, 4> = Chann
 static DATA_CHNL: Channel<ThreadModeRawMutex, SensorData, 10> = Channel::new();
 static RADIO_CTRL_CHNL: Channel<ThreadModeRawMutex, RadioCommand, 10> = Channel::new();
 
+static BATTER: StaticCell<Battery> = StaticCell::new();
+static BATTERY_CTRL_CHNL: Channel<ThreadModeRawMutex, BatteryCommand, 4> = Channel::new();
+
 bind_interrupts!(struct Irqs {
-    I2C0_IRQ => InterruptHandler<I2C0>;
-    I2C1_IRQ => InterruptHandler<I2C1>;
+    ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
+    I2C0_IRQ => embassy_rp::i2c::InterruptHandler<I2C0>;
+    I2C1_IRQ => embassy_rp::i2c::InterruptHandler<I2C1>;
 });
 
+// todo: pass data by reference?
 enum SensorData {
     Soil(f32, u16),
     Air(f32, f32, u16),
+    Status(f32, f32, f32, f32),
 }
 
+// todo: pass data by reference?
 enum RadioCommand {
     Join(JoinMode),
     UplinkAirData([u8; 11]),
     UplinkSoilData([u8; 8]),
+    UplinkStatusData([u8; 11]),
 }
 
 enum AirSensorCommand {
@@ -82,10 +91,41 @@ enum SoilSensorCommand {
     Measure,
 }
 
+enum BatteryCommand {
+    Capacity,
+}
+
+struct Battery {
+    adc: adc::Adc<'static, Async>,
+    tmp_ctrl: adc::Channel<'static>,
+    btr_ctrl: adc::Channel<'static>,
+    g_led: Output<'static>,
+    y_led: Output<'static>,
+    r_led: Output<'static>,
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
+    // initialize battery status led indicators and adc pin to measure battery voltage
+    let g_led = Output::new(p.PIN_22, Level::Low);
+    let y_led = Output::new(p.PIN_27, Level::Low);
+    let r_led = Output::new(p.PIN_28, Level::Low);
+    let adc = Adc::new(p.ADC, Irqs, Default::default());
+    let tmp_ctrl = adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
+    let btr_ctrl = adc::Channel::new_pin(p.PIN_26, Pull::None);
+    let battery = Battery {
+        adc,
+        tmp_ctrl,
+        btr_ctrl,
+        g_led,
+        y_led,
+        r_led,
+    };
+    let battery_ref = BATTER.init(battery);
+
+    // initialize lorawan device (sx1262)
     let nss = Output::new(p.PIN_3.degrade(), Level::High);
     let reset = Output::new(p.PIN_15.degrade(), Level::High);
     let dio1 = Input::new(p.PIN_20.degrade(), Pull::None);
@@ -107,6 +147,7 @@ async fn main(spawner: Spawner) {
     let device: Device<_, Crypto, _, _> = Device::new(region, radio, EmbassyTimer::new(), embassy_rp::clocks::RoscRng);
     let radio_device: &'static _ = RADIO_MUTEX.init(Mutex::new(device));
 
+    // initialize air sensor (scd41)
     let scl_0 = p.PIN_17;
     let sda_0 = p.PIN_16;
     let i2c_0_bus = I2c::new_async(p.I2C0, scl_0, sda_0, Irqs, i2c::Config::default());
@@ -114,6 +155,7 @@ async fn main(spawner: Spawner) {
     let air_sensor = air_sensor::AirSensor::new(config::Config::I2C_ADDR_AIR_SENSOR, i2c_0_bus_ref);
     let air_sensor_ref = AIR_SENSOR_MUTEX.init(Mutex::new(air_sensor));
 
+    // initialize soil sensor (atsamd09)
     let scl_1 = p.PIN_19;
     let sda_1 = p.PIN_18;
     let i2c_1_bus = I2c::new_async(p.I2C1, scl_1, sda_1, Irqs, i2c::Config::default());
@@ -126,12 +168,17 @@ async fn main(spawner: Spawner) {
     spawner
         .spawn(soil_sensor_task(soil_sensor_ref, &SOIL_CTRL_CHNL, &DATA_CHNL))
         .unwrap();
+    spawner
+        .spawn(battery_check_task(battery_ref, &BATTERY_CTRL_CHNL, &DATA_CHNL))
+        .unwrap();
 
+    // todo: implement a state machine for rp2040?
     AIR_CTRL_CHNL.send(AirSensorCommand::Init).await;
     SOIL_CTRL_CHNL.send(SoilSensorCommand::Init).await;
 
     Timer::after_secs(5).await;
 
+    // todo: implement retry logic for OTAA, if fails 5 times use ABP instead
     RADIO_CTRL_CHNL
         .send(RadioCommand::Join(JoinMode::OTAA {
             deveui: DevEui::from(config::Config::DEV_EUI),
@@ -140,55 +187,86 @@ async fn main(spawner: Spawner) {
         }))
         .await;
 
-    loop {
-        Timer::after_secs(30).await;
+    Timer::after_secs(15).await;
 
+    // todo: move control logic to it's own task and make main act as pure bootstrap?
+    let mut ticker = Ticker::every(Duration::from_secs(60 * 5));
+
+    loop {
         AIR_CTRL_CHNL.send(AirSensorCommand::Measure).await;
         SOIL_CTRL_CHNL.send(SoilSensorCommand::Measure).await;
+        BATTERY_CTRL_CHNL.send(BatteryCommand::Capacity).await;
 
-        for _ in 0..2 {
+        for _ in 0..3 {
             match DATA_CHNL.receive().await {
-                SensorData::Air(tmp, hum, co2) => {
+                SensorData::Air(temp, hum, co2) => {
                     info!(
-                        "received air sensor measurements: temperature {:?} humidity {:?} co2 levels {:?}",
-                        tmp, hum, co2
+                        "received air sensor measurements: temperature {=f32} humidity {=f32} co2 levels {=u16}",
+                        temp, hum, co2
                     );
-                    let air_tmp_scaled = (tmp * 10.0) as i16;
-                    let air_hum_scaled = (hum * 2.0) as u8;
+                    let temp_scaled = (temp * 10.0) as i16;
+                    let hum_scaled = (hum * 2.0) as u8;
                     let payload: [u8; 11] = [
                         // encoding using Cayenne LPP codec
-                        0x01,                        // channel     - 1 [air_sensor]
-                        0x67,                        // type        - temperature [2 bytes]
-                        (air_tmp_scaled >> 8) as u8, //             - first byte
-                        air_tmp_scaled as u8,        //             - second byte
-                        0x01,                        // channel     - 1 [air_sensor]
-                        0x68,                        // type        - humidity [1 byte]
-                        air_hum_scaled,              //             - first byte
-                        0x01,                        // channel     - 1 [air_sensor]
-                        0x02,                        // type        - analog input [2 bytes]
-                        (co2 >> 8) as u8,            //             - first byte
-                        co2 as u8,                   //             - second byte
+                        0x01,                     // channel     - 1 [air_sensor]
+                        0x67,                     // type        - temperature [2 bytes]
+                        (temp_scaled >> 8) as u8, //             - first byte
+                        temp_scaled as u8,        //             - second byte
+                        0x01,                     // channel     - 1 [air_sensor]
+                        0x68,                     // type        - humidity [1 byte]
+                        hum_scaled,               //             - first byte
+                        0x01,                     // channel     - 1 [air_sensor]
+                        0x65,                     // type        - illuminance [2 bytes]
+                        (co2 >> 8) as u8,         //             - first byte
+                        co2 as u8,                //             - second byte
                     ];
                     RADIO_CTRL_CHNL.send(RadioCommand::UplinkAirData(payload)).await;
                 }
-                SensorData::Soil(tmp, mst) => {
-                    info!("received soil sensor measurements: temperature {:?} moisture {:?}", tmp, mst);
-                    let soil_tmp_scaled = (tmp * 10.0) as i16;
+                SensorData::Soil(temp, moist) => {
+                    info!("received soil sensor measurements: temperature {=f32} moisture {=u16}", temp, moist);
+                    let temp_scaled = (temp * 10.0) as i16;
                     let payload: [u8; 8] = [
                         // encoding using Cayenne LPP codec
-                        0x02,                         // channel    - 2 [soil_sensor]
-                        0x67,                         // type       - temperature [2 bytes]
-                        (soil_tmp_scaled >> 8) as u8, //            - first byte
-                        soil_tmp_scaled as u8,        //            - second byte
-                        0x02,                         // channel    - 2 [soil_sensor]
-                        0x02,                         // type       - analog input [2 bytes]
-                        (mst >> 8) as u8,             //            - first byte
-                        mst as u8,                    //            - second byte
+                        0x02,                     // channel    - 2 [soil_sensor]
+                        0x67,                     // type       - temperature [2 bytes]
+                        (temp_scaled >> 8) as u8, //            - first byte
+                        temp_scaled as u8,        //            - second byte
+                        0x02,                     // channel    - 2 [soil_sensor]
+                        0x65,                     // type       - illuminance [2 bytes]
+                        (moist >> 8) as u8,       //            - first byte
+                        moist as u8,              //            - second byte
                     ];
                     RADIO_CTRL_CHNL.send(RadioCommand::UplinkSoilData(payload)).await;
                 }
+                SensorData::Status(temp, btr_adc, btr_voltage, btr_capacity) => {
+                    info!(
+                        "received board status: temperature {=f32} adc voltage {=f32} battery voltage {=f32} capacity {=f32}%",
+                        temp, btr_adc, btr_voltage, btr_capacity
+                    );
+
+                    let rp2040_temp_scaled = (temp * 10.0) as u16;
+                    let btr_voltage_scaled = (btr_voltage * 100.0) as u16;
+                    let btr_capacity_scaled = (btr_capacity * 2.0) as u8;
+                    let payload: [u8; 11] = [
+                        // encoding using Cayenne LPP codec
+                        0x03,                            // channel    - 3 [rp2040]
+                        0x67,                            // type       - temperature [2 bytes]
+                        (rp2040_temp_scaled >> 8) as u8, //            - first byte
+                        rp2040_temp_scaled as u8,        //            - second byte
+                        0x03,                            // channel    - 3 [rp2040]
+                        0x02,                            // type       - analog input [2 bytes]
+                        (btr_voltage_scaled >> 8) as u8, //            - first byte
+                        btr_voltage_scaled as u8,        //            - second byte
+                        0x03,                            // channel    - 3 [rp2040]
+                        0x68,                            // type       - humidity [1 bytes]
+                        btr_capacity_scaled,             //            - first byte
+                    ];
+                    RADIO_CTRL_CHNL.send(RadioCommand::UplinkStatusData(payload)).await;
+                }
             }
         }
+
+        ticker.next().await;
     }
 }
 
@@ -211,7 +289,7 @@ async fn radio_module_task(
                 }
             }
             RadioCommand::UplinkAirData(vec) => {
-                info!("sending uplink message {:?}", vec);
+                info!("sending uplink message {=[u8; 11]:#x}", vec);
 
                 let mut radio = radio_mutex.lock().await;
                 let response = radio.send(&vec, 1, true).await;
@@ -222,7 +300,18 @@ async fn radio_module_task(
                 }
             }
             RadioCommand::UplinkSoilData(vec) => {
-                info!("sending uplink message {:?}", vec);
+                info!("sending uplink message {=[u8; 8]:#x}", vec);
+
+                let mut radio = radio_mutex.lock().await;
+                let response = radio.send(&vec, 1, true).await;
+
+                match response {
+                    Ok(_) => info!("successfully sent uplink"),
+                    Err(_) => warn!("failed to send uplink"),
+                }
+            }
+            RadioCommand::UplinkStatusData(vec) => {
+                info!("sending uplink message {=[u8; 11]:#x}", vec);
 
                 let mut radio = radio_mutex.lock().await;
                 let response = radio.send(&vec, 1, true).await;
@@ -292,10 +381,62 @@ async fn soil_sensor_task(
                 info!("reading soil temperature and moisture");
 
                 match soil_sensor.measure().await {
-                    Ok((tmp, mst)) => data_channel.send(SensorData::Soil(tmp, mst)).await,
+                    Ok((temp, moist)) => data_channel.send(SensorData::Soil(temp, moist)).await,
                     Err(_) => warn!("failed to read soil sensor data"),
                 }
             }
         }
     }
+}
+
+#[embassy_executor::task]
+async fn battery_check_task(
+    battery: &'static mut Battery,
+    command_channel: &'static Channel<ThreadModeRawMutex, BatteryCommand, 4>,
+    data_channel: &'static Channel<ThreadModeRawMutex, SensorData, 10>,
+) {
+    loop {
+        match command_channel.receive().await {
+            BatteryCommand::Capacity => {
+                let temp_adc_raw = battery.adc.read(&mut battery.tmp_ctrl).await.unwrap();
+                let temp = convert_to_celsius(temp_adc_raw);
+
+                let btr_adc_raw = battery.adc.read(&mut battery.btr_ctrl).await.unwrap();
+                let btr_adc = (btr_adc_raw as f32 / 4095.0) * 3.3;
+                let btr_voltage = btr_adc * 3.19;
+                let percentage = ((btr_voltage - 3.2) / (4.2 - 3.2)) * 100.0;
+                let capacity = percentage.clamp(0.0, 100.0);
+
+                info!(
+                    "Battery ADC: {:?}, ADC Voltage: {:?}V, Battery Voltage: {:?}V, Capacity: {:?}%",
+                    btr_adc_raw, btr_adc, btr_voltage, capacity
+                );
+
+                // todo: decouple logic from capacity measurment and do based on status update
+                if capacity > 70.0 {
+                    battery.g_led.set_high();
+                    battery.y_led.set_low();
+                    battery.r_led.set_low();
+                } else if capacity > 30.0 {
+                    battery.g_led.set_low();
+                    battery.y_led.set_high();
+                    battery.r_led.set_low();
+                } else {
+                    battery.g_led.set_low();
+                    battery.y_led.set_low();
+                    battery.r_led.set_high();
+                }
+
+                data_channel.send(SensorData::Status(temp, btr_adc, btr_voltage, capacity)).await
+            }
+        }
+    }
+}
+
+fn convert_to_celsius(raw_temp: u16) -> f32 {
+    // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
+    let temp = 27.0 - (raw_temp as f32 * 3.3 / 4096.0 - 0.706) / 0.001721;
+    let sign = if temp < 0.0 { -1.0 } else { 1.0 };
+    let rounded_temp_x10: i16 = ((temp * 10.0) + 0.5 * sign) as i16;
+    (rounded_temp_x10 as f32) / 10.0
 }
