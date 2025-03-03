@@ -11,7 +11,9 @@ mod soil_sensor;
 mod transceiver;
 
 use air_sensor::AirSensor;
-use board::Board;
+use assign_resources::assign_resources;
+use board::{Board, BoardBuilder};
+use core::ops::Deref;
 use defmt::{error, info, warn};
 use device::Device;
 use embassy_executor::Spawner;
@@ -19,11 +21,11 @@ use embassy_rp::adc::{self, Adc};
 use embassy_rp::gpio::{Input, Level, Output, Pin, Pull};
 use embassy_rp::i2c::I2c;
 use embassy_rp::peripherals::{
-    ADC, ADC_TEMP_SENSOR, DMA_CH0, DMA_CH1, I2C0, I2C1, PIN_10, PIN_11, PIN_12, PIN_15, PIN_16, PIN_17, PIN_18, PIN_19, PIN_2, PIN_20, PIN_26, PIN_3,
-    SPI1,
+    self, ADC, ADC_TEMP_SENSOR, DMA_CH0, DMA_CH1, I2C0, I2C1, PIN_10, PIN_11, PIN_12, PIN_15, PIN_16, PIN_17, PIN_18, PIN_19, PIN_2, PIN_20, PIN_26,
+    PIN_3, SPI1,
 };
 use embassy_rp::spi::{Config, Spi};
-use embassy_rp::{bind_interrupts, i2c};
+use embassy_rp::{bind_interrupts, i2c, Peripheral, PeripheralRef};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::once_lock::OnceLock;
@@ -40,9 +42,10 @@ use lorawan_device::{AppEui, AppKey, DevEui};
 use sensor::Sensor;
 use soil_sensor::SoilSensor;
 use static_cell::StaticCell;
-use transceiver::Transceiver;
+use transceiver::{RadioDevice, Transceiver};
 use {defmt_rtt as _, panic_probe as _};
 
+static RADIO_CELL: StaticCell<Mutex<ThreadModeRawMutex, Option<crate::transceiver::RadioDevice>>> = StaticCell::new();
 static RADIO_GUARD: OnceLock<Mutex<ThreadModeRawMutex, crate::transceiver::RadioDevice>> = OnceLock::new();
 static AIR_SENSOR_I2C_BUS: StaticCell<I2c<'static, I2C0, i2c::Async>> = StaticCell::new();
 static AIR_SENSOR_GUARD: OnceLock<Mutex<ThreadModeRawMutex, AirSensor>> = OnceLock::new();
@@ -56,6 +59,40 @@ bind_interrupts!(struct Irqs {
     I2C1_IRQ => embassy_rp::i2c::InterruptHandler<I2C1>;
 });
 
+assign_resources! {
+    vbus: Vbus {
+        pin_24: PIN_24,
+    },
+    vsys: Vsys {
+        adc: ADC,
+        adc_temp_sensor: ADC_TEMP_SENSOR,
+        pin_26: PIN_26,
+        pin_29: PIN_29,
+    },
+    sen_1: Sen1 {
+        pin_16: PIN_16,
+        pin_17: PIN_17,
+        i2c0: I2C0,
+    },
+    sen_2: Sen2 {
+        i2c1: I2C1,
+        pin_19: PIN_19,
+        pin_18: PIN_18,
+    },
+    xcvr: Xcvr{
+        pin_2: PIN_2,
+        pin_3: PIN_3,
+        pin_10: PIN_10,
+        pin_11: PIN_11,
+        pin_12: PIN_12,
+        pin_15: PIN_15,
+        pin_20: PIN_20,
+        dma_ch0: DMA_CH0,
+        dma_ch1: DMA_CH1,
+        spi_1: SPI1,
+    }
+}
+
 enum State {
     Register, // join lorawan network
     Run,      // collect environment data and send over uplink
@@ -65,14 +102,18 @@ enum State {
 #[embassy_executor::main]
 async fn main(s: Spawner) {
     let p = embassy_rp::init(Default::default());
+    let r = split_resources! {p};
 
-    s.spawn(init_board(p.ADC, p.ADC_TEMP_SENSOR, p.PIN_26)).expect("must");
+    let board_builder = BoardBuilder::new();
+
+    if let Ok(radio) = init_lora(r.xcvr).await {
+        board_builder.with_radio(radio);
+    };
+
+    s.spawn(init_board(p.ADC.into_ref(), p.ADC_TEMP_SENSOR.into_ref(), p.PIN_26.into_ref()))
+        .expect("must");
     s.spawn(init_air_sensor(p.I2C0, p.PIN_17, p.PIN_16)).expect("must");
     s.spawn(init_soil_sensor(p.I2C1, p.PIN_19, p.PIN_18)).expect("must");
-    s.spawn(init_lora(
-        p.PIN_3, p.PIN_15, p.PIN_20, p.PIN_2, p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH0, p.DMA_CH1,
-    ))
-    .expect("must");
 
     let mut ticker = Ticker::every(Duration::from_secs(60 * 5));
     let mut state = State::Register;
@@ -168,7 +209,11 @@ async fn main(s: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn init_board(adc: ADC, adc_temp_sensor: ADC_TEMP_SENSOR, pin_26: PIN_26) {
+async fn init_board(
+    adc: PeripheralRef<'static, ADC>,
+    adc_temp_sensor: PeripheralRef<'static, ADC_TEMP_SENSOR>,
+    pin_26: PeripheralRef<'static, PIN_26>,
+) {
     let adc = Adc::new(adc, Irqs, Default::default());
     let tmp_ctrl = adc::Channel::new_temp_sensor(adc_temp_sensor);
     let btr_ctrl = adc::Channel::new_pin(pin_26, Pull::None);
@@ -191,24 +236,12 @@ async fn init_board(adc: ADC, adc_temp_sensor: ADC_TEMP_SENSOR, pin_26: PIN_26) 
     };
 }
 
-#[embassy_executor::task]
-async fn init_lora(
-    pin_3: PIN_3,
-    pin_15: PIN_15,
-    pin_20: PIN_20,
-    pin_2: PIN_2,
-    spi1: SPI1,
-    pin_10: PIN_10,
-    pin_11: PIN_11,
-    pin_12: PIN_12,
-    dma_ch0: DMA_CH0,
-    dma_ch1: DMA_CH1,
-) {
-    let nss = Output::new(pin_3.degrade(), Level::High);
-    let reset = Output::new(pin_15.degrade(), Level::High);
-    let dio1 = Input::new(pin_20.degrade(), Pull::None);
-    let busy = Input::new(pin_2.degrade(), Pull::None);
-    let spi = Spi::new(spi1, pin_10, pin_11, pin_12, dma_ch0, dma_ch1, Config::default());
+async fn init_lora(c: Xcvr) -> Result<&'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>, error::Error> {
+    let nss = Output::new(c.pin_3.degrade(), Level::High);
+    let reset = Output::new(c.pin_15.degrade(), Level::High);
+    let dio1 = Input::new(c.pin_20.degrade(), Pull::None);
+    let busy = Input::new(c.pin_2.degrade(), Pull::None);
+    let spi = Spi::new(c.spi_1, c.pin_10, c.pin_11, c.pin_12, c.dma_ch0, c.dma_ch1, Config::default());
     let spi_bus = ExclusiveDevice::new(spi, nss, Delay).unwrap();
     let sx1262_config = sx126x::Config {
         chip: Sx1262,
@@ -227,19 +260,17 @@ async fn init_lora(
 
     if let Err(_) = lora_radio.init().await {
         error!("radio: failed to initialize");
-        return;
+        return Err(error::Error::LoraRadio);
     } else {
         info!("radio: successfully initialized");
     };
 
     if let Err(_) = lora_radio.info().await {
         error!("radio: failed to read device information");
-        return;
+        return Err(error::Error::LoraRadio);
     };
 
-    if let Err(_) = RADIO_GUARD.init(Mutex::new(lora_radio)) {
-        error!("radio: already initialized!");
-    };
+    RADIO_CELL.try_init(Mutex::new(Some(lora_radio))).ok_or(error::Error::LoraRadio)
 }
 
 #[embassy_executor::task]

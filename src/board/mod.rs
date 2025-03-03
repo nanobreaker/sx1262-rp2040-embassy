@@ -1,6 +1,15 @@
 use embassy_rp::adc::{self, Async};
+use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
+use heapless::Vec;
 
-use crate::{device::Device, error::Error, sensor::Sensor};
+use crate::{
+    air_sensor::AirSensor,
+    device::{self, Device},
+    error::Error,
+    sensor::Sensor,
+    soil_sensor::SoilSensor,
+    transceiver::RadioDevice,
+};
 
 pub struct Data {
     temp: f32,
@@ -30,9 +39,17 @@ impl Into<[u8; 11]> for Data {
 }
 
 pub struct Board {
+    // convert into board_temp_sensor and battery_capacity_sensor
     pub adc: adc::Adc<'static, Async>,
     pub tmp_ctrl: adc::Channel<'static>,
     pub btr_ctrl: adc::Channel<'static>,
+    // pub air_sensor: &'static mut Mutex<ThreadModeRawMutex, Option<AirSensor<'static>>>,
+    // pub soil_sensor: &'static mut Mutex<ThreadModeRawMutex, Option<SoilSensor<'static>>>,
+    pub radio: &'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>,
+}
+
+pub struct BoardBuilder {
+    radio: Option<&'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>>,
 }
 
 impl Device<(), ()> for Board {
@@ -56,6 +73,17 @@ impl Sensor<Data> for Board {
         };
 
         Ok(data)
+    }
+}
+
+impl BoardBuilder {
+    pub fn new() -> BoardBuilder {
+        BoardBuilder { radio: None }
+    }
+
+    pub fn with_radio(mut self, radio: &'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>) -> BoardBuilder {
+        self.radio = Some(radio);
+        self
     }
 }
 

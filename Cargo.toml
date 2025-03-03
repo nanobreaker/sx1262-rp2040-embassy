@@ -28,7 +28,7 @@ lorawan-device = { git = "https://github.com/lora-rs/lora-rs.git", rev = "40926b
     "default-crypto",
     "defmt-03",
 ] }
-
+assign-resources = { git = "https://github.com/adamgreig/assign-resources", rev = "94ad10e2729afdf0fd5a77cd12e68409a982f58a" }
 defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
