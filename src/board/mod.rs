@@ -1,110 +1,74 @@
-use embassy_rp::adc::{self, Async};
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
-use heapless::Vec;
+use static_cell::StaticCell;
 
-use crate::{
-    air_sensor::AirSensor,
-    device::{self, Device},
-    error::Error,
-    sensor::Sensor,
-    soil_sensor::SoilSensor,
-    transceiver::RadioDevice,
-};
+use crate::{air_sensor::AirSensor, board_sensor::BoardSensor, error::Error, soil_sensor::SoilSensor, transceiver::RadioDevice};
 
-pub struct Data {
-    temp: f32,
-    btr_voltage: f32,
-    btr_capacity: f32,
-}
-
-impl Into<[u8; 11]> for Data {
-    fn into(self) -> [u8; 11] {
-        let temp_scl = (self.temp * 10.0) as u16;
-        let btr_voltage_scl = (self.btr_voltage * 100.0) as u16;
-        let btr_capacity_scl = (self.btr_capacity * 2.0) as u8;
-        [
-            0x03,                         // channel    - 3 [rp2040]
-            0x67,                         // type       - temperature [2 bytes]
-            (temp_scl >> 8) as u8,        //            - first byte
-            temp_scl as u8,               //            - second byte
-            0x03,                         // channel    - 3 [rp2040]
-            0x02,                         // type       - analog input [2 bytes]
-            (btr_voltage_scl >> 8) as u8, //            - first byte
-            btr_voltage_scl as u8,        //            - second byte
-            0x03,                         // channel    - 3 [rp2040]
-            0x68,                         // type       - humidity [1 bytes]
-            btr_capacity_scl,             //            - first byte
-        ]
-    }
-}
+static BOARD_SENSOR_CELL: StaticCell<Mutex<ThreadModeRawMutex, BoardSensor>> = StaticCell::new();
+static AIR_SENSOR_CELL: StaticCell<Mutex<ThreadModeRawMutex, AirSensor>> = StaticCell::new();
+static SOIL_SENSOR_CELL: StaticCell<Mutex<ThreadModeRawMutex, SoilSensor>> = StaticCell::new();
+static RADIO_CELL: StaticCell<Mutex<ThreadModeRawMutex, RadioDevice>> = StaticCell::new();
 
 pub struct Board {
-    // convert into board_temp_sensor and battery_capacity_sensor
-    pub adc: adc::Adc<'static, Async>,
-    pub tmp_ctrl: adc::Channel<'static>,
-    pub btr_ctrl: adc::Channel<'static>,
-    // pub air_sensor: &'static mut Mutex<ThreadModeRawMutex, Option<AirSensor<'static>>>,
-    // pub soil_sensor: &'static mut Mutex<ThreadModeRawMutex, Option<SoilSensor<'static>>>,
-    pub radio: &'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>,
+    pub board_sensor: &'static mut Mutex<ThreadModeRawMutex, BoardSensor>,
+    pub air_sensor: &'static mut Mutex<ThreadModeRawMutex, AirSensor>,
+    pub soil_sensor: &'static mut Mutex<ThreadModeRawMutex, SoilSensor<'static>>,
+    pub radio: &'static mut Mutex<ThreadModeRawMutex, RadioDevice>,
 }
 
 pub struct BoardBuilder {
-    radio: Option<&'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>>,
-}
-
-impl Device<(), ()> for Board {
-    async fn init(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
-
-    async fn info(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-impl Sensor<Data> for Board {
-    async fn collect_data(&mut self) -> Result<Data, Error> {
-        let temp = self.get_temperature().await?;
-        let (btr_voltage, btr_capacity) = self.get_battery_capacity().await?;
-        let data = Data {
-            temp,
-            btr_voltage,
-            btr_capacity,
-        };
-
-        Ok(data)
-    }
+    board_sensor: Option<BoardSensor>,
+    air_sensor: Option<AirSensor>,
+    soil_sensor: Option<SoilSensor<'static>>,
+    radio: Option<RadioDevice>,
 }
 
 impl BoardBuilder {
     pub fn new() -> BoardBuilder {
-        BoardBuilder { radio: None }
+        BoardBuilder {
+            board_sensor: None,
+            air_sensor: None,
+            soil_sensor: None,
+            radio: None,
+        }
     }
 
-    pub fn with_radio(mut self, radio: &'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>) -> BoardBuilder {
+    pub fn with_board_sensor(mut self, board_sensor: BoardSensor) -> BoardBuilder {
+        self.board_sensor = Some(board_sensor);
+        self
+    }
+
+    pub fn with_air_sensor(mut self, air_sensor: AirSensor) -> BoardBuilder {
+        self.air_sensor = Some(air_sensor);
+        self
+    }
+
+    pub fn with_soil_sensor(mut self, soil_sensor: SoilSensor<'static>) -> BoardBuilder {
+        self.soil_sensor = Some(soil_sensor);
+        self
+    }
+
+    pub fn with_radio(mut self, radio: RadioDevice) -> BoardBuilder {
         self.radio = Some(radio);
         self
     }
-}
 
-impl Board {
-    async fn get_temperature(&mut self) -> Result<f32, Error> {
-        let temp_adc_raw = self.adc.read(&mut self.tmp_ctrl).await?;
-        let temp_adc = 27.0 - (temp_adc_raw as f32 * 3.3 / 4096.0 - 0.706) / 0.001721;
-        let sign = if temp_adc < 0.0 { -1.0 } else { 1.0 };
-        let rounded_temp_x10: i16 = ((temp_adc * 10.0) + 0.5 * sign) as i16;
-        let temp = (rounded_temp_x10 as f32) / 10.0;
+    pub fn build(self) -> Result<Board, crate::error::Error> {
+        if let (Some(board_sensor), Some(air_sensor), Some(soil_sensor), Some(radio)) =
+            (self.board_sensor, self.air_sensor, self.soil_sensor, self.radio)
+        {
+            let board_sensor_ref = BOARD_SENSOR_CELL.init(Mutex::new(board_sensor));
+            let air_sensor_ref = AIR_SENSOR_CELL.init(Mutex::new(air_sensor));
+            let soil_sensor_ref = SOIL_SENSOR_CELL.init(Mutex::new(soil_sensor));
+            let radio_ref = RADIO_CELL.init(Mutex::new(radio));
 
-        Ok(temp)
-    }
-
-    async fn get_battery_capacity(&mut self) -> Result<(f32, f32), Error> {
-        let btr_adc_raw = self.adc.read(&mut self.btr_ctrl).await?;
-        let btr_adc = (btr_adc_raw as f32 / 4095.0) * 3.3;
-        let btr_voltage = btr_adc * 3.19;
-        let percentage = ((btr_voltage - 3.2) / (4.2 - 3.2)) * 100.0;
-        let btr_capacity = percentage.clamp(0.0, 100.0);
-
-        Ok((btr_voltage, btr_capacity))
+            Ok(Board {
+                board_sensor: board_sensor_ref,
+                air_sensor: air_sensor_ref,
+                soil_sensor: soil_sensor_ref,
+                radio: radio_ref,
+            })
+        } else {
+            Err(Error::FailedToInitialize)
+        }
     }
 }

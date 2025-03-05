@@ -1,7 +1,7 @@
-use crate::{device::Device, error::Error, sensor::Sensor};
+use crate::{config, device::Device, error::Error, sensor::Sensor, AirSen, Irqs};
 
 use embassy_rp::{
-    i2c::{Async, I2c},
+    i2c::{self, Async, I2c},
     peripherals::I2C0,
 };
 use embassy_time::Timer;
@@ -42,25 +42,27 @@ pub struct Info {
     pub serial_number: u64,
 }
 
-pub struct AirSensor<'a> {
+pub struct AirSensor {
     addr: u16,
-    bus: &'a mut I2c<'a, I2C0, Async>,
+    bus: I2c<'static, I2C0, Async>,
 }
 
-impl<'a> Device<u64, Info> for AirSensor<'a> {
-    async fn init(&mut self) -> Result<u64, Error> {
-        self.get_serial_number().await
+impl Device<AirSen> for AirSensor {
+    async fn build(r: AirSen) -> Result<Self, Error> {
+        let i2c_0_bus = I2c::new_async(r.i2c0, r.pin_17, r.pin_16, Irqs, i2c::Config::default());
+
+        Ok(AirSensor {
+            addr: config::Config::I2C_ADDR_AIR_SENSOR,
+            bus: i2c_0_bus,
+        })
     }
 
-    async fn info(&mut self) -> Result<Info, Error> {
-        let serial_number = self.get_serial_number().await?;
-        let info = Info { serial_number };
-
-        Ok(info)
+    async fn verify(&mut self) -> Result<(), Error> {
+        todo!()
     }
 }
 
-impl<'a> Sensor<Data> for AirSensor<'a> {
+impl Sensor<Data> for AirSensor {
     async fn collect_data(&mut self) -> Result<Data, Error> {
         self.write(MEASURE_SINGLE_SHOT_COMMAND).await?;
 
@@ -84,11 +86,7 @@ impl<'a> Sensor<Data> for AirSensor<'a> {
     }
 }
 
-impl<'a> AirSensor<'a> {
-    pub fn new(addr: u16, i2c_bus: &'a mut I2c<'a, I2C0, Async>) -> Self {
-        Self { addr, bus: i2c_bus }
-    }
-
+impl AirSensor {
     async fn get_serial_number(&mut self) -> Result<u64, Error> {
         let mut buffer = [0u8; 9];
 

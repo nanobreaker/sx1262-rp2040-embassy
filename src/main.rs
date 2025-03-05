@@ -3,6 +3,7 @@
 
 mod air_sensor;
 mod board;
+mod board_sensor;
 mod config;
 mod device;
 mod error;
@@ -13,6 +14,8 @@ mod transceiver;
 use air_sensor::AirSensor;
 use assign_resources::assign_resources;
 use board::{Board, BoardBuilder};
+use board_sensor::BoardSensor;
+use config::Config;
 use core::ops::Deref;
 use defmt::{error, info, warn};
 use device::Device;
@@ -31,6 +34,7 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::once_lock::OnceLock;
 use embassy_time::{Delay, Duration, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
+use error::Error;
 use lora_phy::iv::GenericSx126xInterfaceVariant;
 use lora_phy::lorawan_radio::LorawanRadio;
 use lora_phy::sx126x::TcxoCtrlVoltage;
@@ -45,14 +49,6 @@ use static_cell::StaticCell;
 use transceiver::{RadioDevice, Transceiver};
 use {defmt_rtt as _, panic_probe as _};
 
-static RADIO_CELL: StaticCell<Mutex<ThreadModeRawMutex, Option<crate::transceiver::RadioDevice>>> = StaticCell::new();
-static RADIO_GUARD: OnceLock<Mutex<ThreadModeRawMutex, crate::transceiver::RadioDevice>> = OnceLock::new();
-static AIR_SENSOR_I2C_BUS: StaticCell<I2c<'static, I2C0, i2c::Async>> = StaticCell::new();
-static AIR_SENSOR_GUARD: OnceLock<Mutex<ThreadModeRawMutex, AirSensor>> = OnceLock::new();
-static SOIL_SENSOR_I2C_BUS: StaticCell<I2c<'static, I2C1, i2c::Async>> = StaticCell::new();
-static SOIL_SENSOR_GUARD: OnceLock<Mutex<ThreadModeRawMutex, SoilSensor>> = OnceLock::new();
-static BOARD_GUARD: OnceLock<Mutex<ThreadModeRawMutex, Board>> = OnceLock::new();
-
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
     I2C0_IRQ => embassy_rp::i2c::InterruptHandler<I2C0>;
@@ -60,24 +56,22 @@ bind_interrupts!(struct Irqs {
 });
 
 assign_resources! {
-    vbus: Vbus {
-        pin_24: PIN_24,
-    },
-    vsys: Vsys {
+    board: BoardSen {
         adc: ADC,
         adc_temp_sensor: ADC_TEMP_SENSOR,
+        pin_24: PIN_24,
         pin_26: PIN_26,
         pin_29: PIN_29,
     },
-    sen_1: Sen1 {
+    air: AirSen {
         pin_16: PIN_16,
         pin_17: PIN_17,
         i2c0: I2C0,
     },
-    sen_2: Sen2 {
-        i2c1: I2C1,
-        pin_19: PIN_19,
+    soil: SoilSen {
         pin_18: PIN_18,
+        pin_19: PIN_19,
+        i2c1: I2C1,
     },
     xcvr: Xcvr{
         pin_2: PIN_2,
@@ -89,14 +83,14 @@ assign_resources! {
         pin_20: PIN_20,
         dma_ch0: DMA_CH0,
         dma_ch1: DMA_CH1,
-        spi_1: SPI1,
+        spi1: SPI1,
     }
 }
 
 enum State {
-    Register, // join lorawan network
-    Run,      // collect environment data and send over uplink
-    Sleep,    // do nothing
+    Auth,
+    Run,
+    Sleep,
 }
 
 #[embassy_executor::main]
@@ -104,25 +98,30 @@ async fn main(s: Spawner) {
     let p = embassy_rp::init(Default::default());
     let r = split_resources! {p};
 
-    let board_builder = BoardBuilder::new();
+    let board_sensor = BoardSensor::build(r.board).await.expect("board sensors should be functional");
+    let air_sensor = AirSensor::build(r.air).await.expect("air sensor should be connected");
+    let soil_sensor = SoilSensor::build(r.soil).await.expect("soil sensor should be connected");
+    let radio = RadioDevice::build(r.xcvr).await.expect("radio module should be connected");
+    let board = BoardBuilder::new()
+        .with_board_sensor(board_sensor)
+        .with_radio(radio)
+        .with_air_sensor(air_sensor)
+        .with_soil_sensor(soil_sensor)
+        .build()
+        .expect("all devices should be connected");
 
-    if let Ok(radio) = init_lora(r.xcvr).await {
-        board_builder.with_radio(radio);
-    };
+    s.spawn(orchestator(board)).expect("executor should be initialized")
+}
 
-    s.spawn(init_board(p.ADC.into_ref(), p.ADC_TEMP_SENSOR.into_ref(), p.PIN_26.into_ref()))
-        .expect("must");
-    s.spawn(init_air_sensor(p.I2C0, p.PIN_17, p.PIN_16)).expect("must");
-    s.spawn(init_soil_sensor(p.I2C1, p.PIN_19, p.PIN_18)).expect("must");
-
+#[embassy_executor::task]
+async fn orchestator(mut board: Board) {
     let mut ticker = Ticker::every(Duration::from_secs(60 * 5));
-    let mut state = State::Register;
+    let mut state = State::Auth;
     let mut join_counter: u8 = 0;
     loop {
         state = match state {
-            State::Register => {
-                let radio_mutex = RADIO_GUARD.get().await;
-                let mut radio = radio_mutex.lock().await;
+            State::Auth => {
+                let mut radio = board.radio.lock().await;
                 let response = radio
                     .auth(&JoinMode::OTAA {
                         deveui: DevEui::from(config::Config::DEV_EUI),
@@ -144,20 +143,15 @@ async fn main(s: Spawner) {
                             State::Sleep
                         } else {
                             join_counter += 1;
-                            State::Register
+                            State::Auth
                         }
                     }
                 }
             }
             State::Run => {
-                let board_mtx = BOARD_GUARD.get().await;
-                let mut board = board_mtx.lock().await;
-
-                let air_sensor_mtx = AIR_SENSOR_GUARD.get().await;
-                let mut air_sensor = air_sensor_mtx.lock().await;
-
-                let soil_sensor_mtx = SOIL_SENSOR_GUARD.get().await;
-                let mut soil_sensor = soil_sensor_mtx.lock().await;
+                // let mut board = bo.lock().await;
+                let mut air_sensor = board.air_sensor.lock().await;
+                let mut soil_sensor = board.soil_sensor.lock().await;
 
                 let (air, soil, board) =
                     embassy_futures::join::join3(air_sensor.collect_data(), soil_sensor.collect_data(), board.collect_data()).await;
@@ -201,47 +195,19 @@ async fn main(s: Spawner) {
             }
             State::Sleep => {
                 Timer::after_secs(60 * 10).await;
-                State::Register
+                State::Auth
             }
         };
         ticker.next().await;
     }
 }
 
-#[embassy_executor::task]
-async fn init_board(
-    adc: PeripheralRef<'static, ADC>,
-    adc_temp_sensor: PeripheralRef<'static, ADC_TEMP_SENSOR>,
-    pin_26: PeripheralRef<'static, PIN_26>,
-) {
-    let adc = Adc::new(adc, Irqs, Default::default());
-    let tmp_ctrl = adc::Channel::new_temp_sensor(adc_temp_sensor);
-    let btr_ctrl = adc::Channel::new_pin(pin_26, Pull::None);
-    let mut board = Board { adc, tmp_ctrl, btr_ctrl };
-
-    if let Err(_) = board.init().await {
-        error!("rp2040: failed to initialize");
-        return;
-    } else {
-        info!("rp2040: successfully initialized");
-    };
-
-    if let Err(_) = board.info().await {
-        error!("rp2040: failed to read board information");
-        return;
-    };
-
-    if let Err(_) = BOARD_GUARD.init(Mutex::new(board)) {
-        error!("rp2040: already initialized!");
-    };
-}
-
-async fn init_lora(c: Xcvr) -> Result<&'static mut Mutex<ThreadModeRawMutex, Option<RadioDevice>>, error::Error> {
+async fn init_transceiver(c: Xcvr) -> Result<&'static mut Mutex<ThreadModeRawMutex, RadioDevice>, error::Error> {
     let nss = Output::new(c.pin_3.degrade(), Level::High);
     let reset = Output::new(c.pin_15.degrade(), Level::High);
     let dio1 = Input::new(c.pin_20.degrade(), Pull::None);
     let busy = Input::new(c.pin_2.degrade(), Pull::None);
-    let spi = Spi::new(c.spi_1, c.pin_10, c.pin_11, c.pin_12, c.dma_ch0, c.dma_ch1, Config::default());
+    let spi = Spi::new(c.spi1, c.pin_10, c.pin_11, c.pin_12, c.dma_ch0, c.dma_ch1, Config::default());
     let spi_bus = ExclusiveDevice::new(spi, nss, Delay).unwrap();
     let sx1262_config = sx126x::Config {
         chip: Sx1262,
@@ -251,7 +217,7 @@ async fn init_lora(c: Xcvr) -> Result<&'static mut Mutex<ThreadModeRawMutex, Opt
     };
     let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
     let lora = LoRa::new(Sx126x::new(spi_bus, iv, sx1262_config), true, Delay).await.unwrap();
-    let mut radio: LorawanRadio<_, _, 14> = lora.into();
+    let mut radio: LorawanRadio<_, _, config::Config::TEST::take> = lora.into();
     radio.set_rx_window_lead_time(config::Config::RX_WINDOW_LEAD_TIME);
     radio.set_rx_window_buffer(config::Config::RX_WINDOW_BUFFER);
     let region: region::Configuration = region::Configuration::new(config::Config::LORAWAN_REGION);
@@ -270,12 +236,11 @@ async fn init_lora(c: Xcvr) -> Result<&'static mut Mutex<ThreadModeRawMutex, Opt
         return Err(error::Error::LoraRadio);
     };
 
-    RADIO_CELL.try_init(Mutex::new(Some(lora_radio))).ok_or(error::Error::LoraRadio)
+    RADIO_CELL.try_init(Mutex::new(lora_radio)).ok_or(error::Error::LoraRadio)
 }
 
-#[embassy_executor::task]
-async fn init_air_sensor(i2c0: I2C0, pin_17: PIN_17, pin_16: PIN_16) {
-    let i2c_0_bus = I2c::new_async(i2c0, pin_17, pin_16, Irqs, i2c::Config::default());
+async fn init_air_sensor(c: AirSen) -> Result<&'static mut Mutex<ThreadModeRawMutex, AirSensor<'static>>, error::Error> {
+    let i2c_0_bus = I2c::new_async(c.i2c0, c.pin_17, c.pin_16, Irqs, i2c::Config::default());
     let i2c_0_bus_ref = AIR_SENSOR_I2C_BUS.init(i2c_0_bus);
     let mut air_sensor = air_sensor::AirSensor::new(config::Config::I2C_ADDR_AIR_SENSOR, i2c_0_bus_ref);
 
@@ -286,7 +251,7 @@ async fn init_air_sensor(i2c0: I2C0, pin_17: PIN_17, pin_16: PIN_16) {
         }
         Err(_) => {
             error!("air sensor: failed to initialize");
-            return;
+            return Err(error::Error::FailedToInitialize);
         }
     };
 
@@ -300,18 +265,15 @@ async fn init_air_sensor(i2c0: I2C0, pin_17: PIN_17, pin_16: PIN_16) {
         }
         Err(_) => {
             error!("air sensor: failed to read device information");
-            return;
+            return Err(error::Error::FailedToInitialize);
         }
     };
 
-    if let Err(_) = AIR_SENSOR_GUARD.init(Mutex::new(air_sensor)) {
-        error!("air sensor: already initialized!");
-    };
+    AIR_SENSOR_CELL.try_init(Mutex::new(air_sensor)).ok_or(error::Error::FailedToInitialize)
 }
 
-#[embassy_executor::task]
-async fn init_soil_sensor(i2c1: I2C1, pin_19: PIN_19, pin_18: PIN_18) {
-    let i2c_1_bus = I2c::new_async(i2c1, pin_19, pin_18, Irqs, i2c::Config::default());
+async fn init_soil_sensor(c: SoilSen) -> Result<&'static mut Mutex<ThreadModeRawMutex, SoilSensor<'static>>, error::Error> {
+    let i2c_1_bus = I2c::new_async(c.i2c1, c.pin_19, c.pin_18, Irqs, i2c::Config::default());
     let i2c_1_bus_ref = SOIL_SENSOR_I2C_BUS.init(i2c_1_bus);
     let mut soil_sensor = soil_sensor::SoilSensor::new(config::Config::I2C_ADDR_SOIL_SENSOR, i2c_1_bus_ref);
 
@@ -322,7 +284,7 @@ async fn init_soil_sensor(i2c1: I2C1, pin_19: PIN_19, pin_18: PIN_18) {
         }
         Err(_) => {
             error!("soil sensor: failed to initialize");
-            return;
+            return Err(error::Error::FailedToInitialize);
         }
     };
 
@@ -338,11 +300,9 @@ async fn init_soil_sensor(i2c1: I2C1, pin_19: PIN_19, pin_18: PIN_18) {
         }
         Err(_) => {
             error!("soil sensor: failed to read device information");
-            return;
+            return Err(error::Error::FailedToInitialize);
         }
     };
 
-    if let Err(_) = SOIL_SENSOR_GUARD.init(Mutex::new(soil_sensor)) {
-        error!("soil sensor: already initialized!");
-    };
+    SOIL_SENSOR_CELL.try_init(Mutex::new(soil_sensor)).ok_or(error::Error::FailedToInitialize)
 }

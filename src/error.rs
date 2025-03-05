@@ -1,5 +1,6 @@
 #[derive(Debug)]
 pub enum Error {
+    FailedToInitialize,
     LoraRadio,
     LoraMac,
     I2CBusReadFailed,
