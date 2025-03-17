@@ -1,4 +1,4 @@
-use crate::{config, device::Device, error::Error, sensor::Sensor, AirSen, Irqs};
+use crate::{config, device::Device, error::Error, sensor::Sensor, AirSensorResources, Irqs};
 
 use embassy_rp::{
     i2c::{self, Async, I2c},
@@ -12,16 +12,17 @@ const SERIAL_NUMBER_COMMAND: u16 = 0x3682;
 const READ_MEASUREMENT_COMMAND: u16 = 0xec05;
 const MEASURE_SINGLE_SHOT_COMMAND: u16 = 0x219d;
 
+#[derive(defmt::Format)]
 pub struct Data {
-    temp: f32,
-    hum: f32,
-    co2: u16,
+    pub temp: f32,
+    pub hum: f32,
+    pub co2: u16,
 }
 
-impl Into<[u8; 11]> for Data {
-    fn into(self) -> [u8; 11] {
-        let temp_scl = (self.temp * 10.0) as i16;
-        let hum_scl = (self.hum * 2.0) as u8;
+impl From<Data> for [u8; 11] {
+    fn from(val: Data) -> Self {
+        let temp_scl = (val.temp * 10.0) as i16;
+        let hum_scl = (val.hum * 2.0) as u8;
         [
             0x01,                  // channel    - 1 [air_sensor]
             0x67,                  // type       - temperature [2 bytes]
@@ -32,12 +33,13 @@ impl Into<[u8; 11]> for Data {
             hum_scl,               //            - first byte
             0x01,                  // channel    - 1 [air_sensor]
             0x65,                  // type       - illuminance [2 bytes]
-            (self.co2 >> 8) as u8, //            - first byte
-            self.co2 as u8,        //            - second byte
+            (val.co2 >> 8) as u8,  //            - first byte
+            val.co2 as u8,         //            - second byte
         ]
     }
 }
 
+#[derive(defmt::Format)]
 pub struct Info {
     pub serial_number: u64,
 }
@@ -47,8 +49,9 @@ pub struct AirSensor {
     bus: I2c<'static, I2C0, Async>,
 }
 
-impl Device<AirSen> for AirSensor {
-    async fn build(r: AirSen) -> Result<Self, Error> {
+impl Device<AirSensorResources> for AirSensor {
+    type Info = Info;
+    async fn prepare(r: AirSensorResources) -> Result<Self, Error> {
         let i2c_0_bus = I2c::new_async(r.i2c0, r.pin_17, r.pin_16, Irqs, i2c::Config::default());
 
         Ok(AirSensor {
@@ -57,8 +60,9 @@ impl Device<AirSen> for AirSensor {
         })
     }
 
-    async fn verify(&mut self) -> Result<(), Error> {
-        todo!()
+    async fn init(&mut self) -> Result<Self::Info, crate::error::Error> {
+        let serial_number = self.get_serial_number().await?;
+        Ok(Info { serial_number })
     }
 }
 

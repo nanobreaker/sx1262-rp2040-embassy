@@ -1290,32 +1290,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rp2040"
-version = "0.1.0"
-dependencies = [
- "assign-resources",
- "cortex-m",
- "cortex-m-rt",
- "defmt",
- "defmt-rtt",
- "embassy-embedded-hal",
- "embassy-executor",
- "embassy-futures",
- "embassy-rp",
- "embassy-sync",
- "embassy-time",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "embedded-hal-bus",
- "heapless",
- "lora-phy",
- "lorawan-device",
- "panic-probe",
- "portable-atomic",
- "static_cell",
-]
-
-[[package]]
 name = "rp2040-boot2"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1344,6 +1318,32 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seed"
+version = "0.1.0"
+dependencies = [
+ "assign-resources",
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt",
+ "defmt-rtt",
+ "embassy-embedded-hal",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-rp",
+ "embassy-sync",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-hal-bus",
+ "heapless",
+ "lora-phy",
+ "lorawan-device",
+ "panic-probe",
+ "portable-atomic",
+ "static_cell",
+]
 
 [[package]]
 name = "semver"

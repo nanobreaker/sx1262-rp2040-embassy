@@ -3,7 +3,7 @@ use embassy_rp::{
     gpio::{self, Input, Pull},
 };
 
-use crate::{device::Device, error::Error, sensor::Sensor, BoardSen, Irqs};
+use crate::{device::Device, error::Error, sensor::Sensor, BoardSensorResources, Irqs};
 
 pub struct BoardSensor {
     adc: adc::Adc<'static, Async>,
@@ -13,17 +13,18 @@ pub struct BoardSensor {
     vsys_adc: adc::Channel<'static>, // system voltage
 }
 
+#[derive(defmt::Format)]
 pub struct Data {
-    temp: f32,
-    btr_voltage: f32,
-    btr_capacity: f32,
+    pub temp: f32,
+    pub btr_voltage: f32,
+    pub btr_capacity: f32,
 }
 
-impl Into<[u8; 11]> for Data {
-    fn into(self) -> [u8; 11] {
-        let temp_scl = (self.temp * 10.0) as u16;
-        let btr_voltage_scl = (self.btr_voltage * 100.0) as u16;
-        let btr_capacity_scl = (self.btr_capacity * 2.0) as u8;
+impl From<Data> for [u8; 11] {
+    fn from(value: Data) -> Self {
+        let temp_scl = (value.temp * 10.0) as u16;
+        let btr_voltage_scl = (value.btr_voltage * 100.0) as u16;
+        let btr_capacity_scl = (value.btr_capacity * 2.0) as u8;
         [
             0x03,                         // channel    - 3 [rp2040]
             0x67,                         // type       - temperature [2 bytes]
@@ -40,8 +41,10 @@ impl Into<[u8; 11]> for Data {
     }
 }
 
-impl Device<BoardSen> for BoardSensor {
-    async fn build(r: BoardSen) -> Result<BoardSensor, Error> {
+impl Device<BoardSensorResources> for BoardSensor {
+    type Info = ();
+
+    async fn prepare(r: BoardSensorResources) -> Result<BoardSensor, Error> {
         let adc = adc::Adc::new(r.adc, Irqs, Default::default());
         let temp_adc = adc::Channel::new_temp_sensor(r.adc_temp_sensor);
         let btr_adc = adc::Channel::new_pin(r.pin_26, Pull::None);
@@ -57,14 +60,21 @@ impl Device<BoardSen> for BoardSensor {
         })
     }
 
-    async fn verify(&mut self) -> Result<(), Error> {
-        todo!()
+    async fn init(&mut self) -> Result<Self::Info, Error> {
+        Ok(())
     }
 }
 
 impl Sensor<Data> for BoardSensor {
     async fn collect_data(&mut self) -> Result<Data, Error> {
-        todo!()
+        let temp = self.get_temperature().await?;
+        let (btr_voltage, btr_capacity) = self.get_battery_capacity().await?;
+
+        Ok(Data {
+            temp,
+            btr_voltage,
+            btr_capacity,
+        })
     }
 }
 

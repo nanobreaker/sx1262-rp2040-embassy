@@ -1,6 +1,7 @@
-#[derive(Debug)]
+#[derive(Debug, defmt::Format)]
 pub enum Error {
     FailedToInitialize,
+    FailedToCollectData,
     LoraRadio,
     LoraMac,
     I2CBusReadFailed,
