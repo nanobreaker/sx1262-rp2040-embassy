@@ -16,7 +16,7 @@ connect_under_reset = false
 [default.rtt]
 enabled = true
 up_channels = [
-    { channel = 0, mode = "NoBlockSkip", format = "Defmt", log_format = "[{t:<16}][{L}] {s}" },
+    { channel = 0, mode = "NoBlockSkip", format = "Defmt", log_format = "{t:<13}{L} {s}" },
 ]
 down_channels = []
 timeout = 3000

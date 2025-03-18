@@ -6,11 +6,12 @@ use static_cell::StaticCell;
 use crate::{
     air_sensor::AirSensor,
     board_sensor::BoardSensor,
+    database::{Database, EkvDatabase},
     device::Device,
     error::Error,
     sensor::Sensor,
     soil_sensor::SoilSensor,
-    transceiver::{RadioDevice, Transceiver},
+    transceiver::{self, RadioDevice, Transceiver},
 };
 
 static BOARD_SENSOR_CELL: StaticCell<Mutex<ThreadModeRawMutex, BoardSensor>> = StaticCell::new();
@@ -23,6 +24,7 @@ pub struct Board {
     pub air_sensor: &'static mut Mutex<ThreadModeRawMutex, AirSensor>,
     pub soil_sensor: &'static mut Mutex<ThreadModeRawMutex, SoilSensor>,
     pub transceiver: &'static mut Mutex<ThreadModeRawMutex, RadioDevice>,
+    pub database: EkvDatabase,
 }
 
 pub struct BoardBuilder {
@@ -30,6 +32,7 @@ pub struct BoardBuilder {
     air_sensor: Option<AirSensor>,
     soil_sensor: Option<SoilSensor>,
     radio: Option<RadioDevice>,
+    database: Option<EkvDatabase>,
 }
 
 impl Board {
@@ -66,6 +69,13 @@ impl Board {
             .inspect(|i| defmt::info!("Initialized transceiver {:?}", i))
             .map_err(|e| errors.push(e));
 
+        let _ = self
+            .database
+            .init()
+            .await
+            .inspect(|i| defmt::info!("Initialized flash memory {:?}", i))
+            .map_err(|e| errors.push(e));
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -73,6 +83,46 @@ impl Board {
             for error in errors {
                 defmt::error!("{:?}", error);
             }
+            Err(Error::FailedToInitialize)
+        }
+    }
+
+    pub async fn join_otaa(&mut self) -> Result<(), Error> {
+        let mut transceiver = self.transceiver.lock().await;
+
+        transceiver.join_otaa().await
+    }
+
+    pub async fn initialize_uplink_frame_counter(&mut self) -> Result<(), Error> {
+        if let None = self.database.get(&crate::database::Key::UPLINK_FRAME_COUNTER).await {
+            self.database.put(&crate::database::Key::UPLINK_FRAME_COUNTER, 0).await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn initialize_downlink_frame_counter(&mut self) -> Result<(), Error> {
+        if let None = self.database.get(&crate::database::Key::DOWNLINK_FRAME_COUNTER).await {
+            self.database.put(&crate::database::Key::DOWNLINK_FRAME_COUNTER, 0).await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn increment_uplink_frame_counter(&mut self) -> Result<(), Error> {
+        if let Some(mut counter) = self.database.get(&crate::database::Key::UPLINK_FRAME_COUNTER).await {
+            counter += 1;
+            self.database.put(&crate::database::Key::UPLINK_FRAME_COUNTER, counter).await
+        } else {
+            Err(Error::FailedToInitialize)
+        }
+    }
+
+    pub async fn increment_downlink_frame_counter(&mut self) -> Result<(), Error> {
+        if let Some(mut counter) = self.database.get(&crate::database::Key::DOWNLINK_FRAME_COUNTER).await {
+            counter += 1;
+            self.database.put(&crate::database::Key::DOWNLINK_FRAME_COUNTER, counter).await
+        } else {
             Err(Error::FailedToInitialize)
         }
     }
@@ -89,36 +139,30 @@ impl Board {
         let _ = board_sensor
             .collect_data()
             .await
-            .inspect(|d| defmt::info!("Board sensor {:?}", d))
+            .inspect(|d| defmt::info!("Board {:?}", d))
             .map(|d| {
                 let bytes: [u8; 11] = d.into();
-                for byte in bytes {
-                    let _ = payload.push(byte);
-                }
+                payload.extend_from_slice(&bytes).expect("should extend");
             })
             .map_err(|e| errors.push(e));
 
         let _ = air_sensor
             .collect_data()
             .await
-            .inspect(|d| defmt::info!("Air sensor {:?}", d))
+            .inspect(|d| defmt::info!("Air {:?}", d))
             .map(|d| {
                 let bytes: [u8; 11] = d.into();
-                for byte in bytes {
-                    let _ = payload.push(byte);
-                }
+                payload.extend_from_slice(&bytes).expect("should extend");
             })
             .map_err(|e| errors.push(e));
 
         let _ = soil_sensor
             .collect_data()
             .await
-            .inspect(|d| defmt::info!("Soil sensor {:?}", d))
+            .inspect(|d| defmt::info!("Soil {:?}", d))
             .map(|d| {
                 let bytes: [u8; 8] = d.into();
-                for byte in bytes {
-                    let _ = payload.push(byte);
-                }
+                payload.extend_from_slice(&bytes).expect("should extend");
             })
             .map_err(|e| errors.push(e));
 
@@ -136,7 +180,8 @@ impl Board {
     pub async fn uplink(&mut self, data: &[u8]) -> Result<(), Error> {
         let mut transceiver = self.transceiver.lock().await;
 
-        defmt::info!("Sending uplink message: {=[u8]:#x}", data);
+        defmt::info!("Sending uplink message");
+        defmt::info!("Payload {=[u8]:x}", data);
 
         match transceiver.uplink(data).await {
             Ok(SendResponse::DownlinkReceived(f_count)) => {
@@ -170,6 +215,7 @@ impl BoardBuilder {
             air_sensor: None,
             soil_sensor: None,
             radio: None,
+            database: None,
         }
     }
 
@@ -193,9 +239,14 @@ impl BoardBuilder {
         self
     }
 
+    pub fn with_database(mut self, database: EkvDatabase) -> BoardBuilder {
+        self.database = Some(database);
+        self
+    }
+
     pub fn build(self) -> Result<Board, crate::error::Error> {
-        if let (Some(board_sensor), Some(air_sensor), Some(soil_sensor), Some(radio)) =
-            (self.board_sensor, self.air_sensor, self.soil_sensor, self.radio)
+        if let (Some(board_sensor), Some(air_sensor), Some(soil_sensor), Some(radio), Some(database)) =
+            (self.board_sensor, self.air_sensor, self.soil_sensor, self.radio, self.database)
         {
             let board_sensor_ref = BOARD_SENSOR_CELL.init(Mutex::new(board_sensor));
             let air_sensor_ref = AIR_SENSOR_CELL.init(Mutex::new(air_sensor));
@@ -207,6 +258,7 @@ impl BoardBuilder {
                 air_sensor: air_sensor_ref,
                 soil_sensor: soil_sensor_ref,
                 transceiver: radio_ref,
+                database,
             })
         } else {
             Err(Error::FailedToInitialize)

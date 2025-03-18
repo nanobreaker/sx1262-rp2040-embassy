@@ -5,6 +5,7 @@ mod air_sensor;
 mod board;
 mod board_sensor;
 mod config;
+mod database;
 mod device;
 mod error;
 mod sensor;
@@ -16,6 +17,7 @@ use assign_resources::assign_resources;
 use board::{Board, BoardBuilder};
 use board_sensor::BoardSensor;
 use device::Device;
+use ekv::Database;
 use embassy_executor::Spawner;
 use embassy_rp::peripherals::{I2C0, I2C1};
 use embassy_rp::{bind_interrupts, peripherals};
@@ -59,6 +61,9 @@ assign_resources! {
         dma_ch0: DMA_CH0,
         dma_ch1: DMA_CH1,
         spi1: SPI1,
+    },
+    database: DatabaseResources{
+        flash: FLASH,
     }
 }
 
@@ -76,11 +81,13 @@ async fn main(s: Spawner) {
     let air_sensor = AirSensor::prepare(res.air).await.expect("air sensor should be connected");
     let soil_sensor = SoilSensor::prepare(res.soil).await.expect("soil sensor should be connected");
     let radio = RadioDevice::prepare(res.xcvr).await.expect("radio module should be connected");
+    let database = Database::prepare(res.database).await.expect("flash memory should be connected");
     let mut board = BoardBuilder::new()
         .with_board_sensor(board_sensor)
         .with_air_sensor(air_sensor)
         .with_soil_sensor(soil_sensor)
         .with_radio(radio)
+        .with_database(database)
         .build()
         .expect("all devices should be connected");
 
@@ -101,15 +108,13 @@ async fn orchestator(mut board: Board) {
             State::Auth => {
                 defmt::info!("Entering authentication mode");
 
-                let mut transceiver = board.transceiver.lock().await;
-
-                match transceiver.join_otaa().await {
+                match board.join_otaa().await {
                     Ok(()) => {
-                        defmt::info!("Joined lorawan network");
+                        board.initialize_uplink_frame_counter().await.expect("ez");
+                        board.initialize_downlink_frame_counter().await.expect("ez");
                         State::Run
                     }
-                    Err(e) => {
-                        defmt::error!("Failed to join lorawan network {:?}", e);
+                    Err(_) => {
                         if auth_counter >= 5 {
                             State::Sleep
                         } else {
@@ -124,7 +129,11 @@ async fn orchestator(mut board: Board) {
 
                 if let Ok(data) = board.collect_data().await {
                     match board.uplink(data.as_slice()).await {
-                        Ok(()) => State::Run,
+                        Ok(()) => {
+                            board.increment_uplink_frame_counter().await.expect("ez");
+                            board.increment_downlink_frame_counter().await.expect("ez");
+                            State::Run
+                        }
                         Err(_) => State::Sleep,
                     }
                 } else {
@@ -133,10 +142,14 @@ async fn orchestator(mut board: Board) {
             }
             State::Sleep => {
                 defmt::info!("Entering sleep mode");
+
                 Timer::after_secs(60 * 10).await;
+
                 State::Auth
             }
         };
+
+        defmt::info!("Entering sleep mode untill next tick");
         ticker.next().await;
     }
 }

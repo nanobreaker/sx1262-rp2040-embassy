@@ -42,6 +42,8 @@ pub trait Transceiver {
 
 impl Transceiver for RadioDevice {
     async fn join_otaa(&mut self) -> Result<(), Error> {
+        defmt::info!("Joining lorawan network");
+
         let response = self
             .join(&JoinMode::OTAA {
                 deveui: DevEui::from(config::Config::DEV_EUI),
@@ -51,9 +53,18 @@ impl Transceiver for RadioDevice {
             .await;
 
         match response {
-            Ok(JoinResponse::JoinSuccess) => Ok(()),
-            Ok(JoinResponse::NoJoinAccept) => Err(Error::LoraRadio),
-            Err(error) => Err(error.into()),
+            Ok(JoinResponse::JoinSuccess) => {
+                defmt::info!("Joined lorawan network");
+                Ok(())
+            }
+            Ok(JoinResponse::NoJoinAccept) => {
+                defmt::warn!("Failed to join lorawan network, no join accept received");
+                Err(Error::LoraRadio)
+            }
+            Err(e) => {
+                defmt::info!("Failed to join lorawan network {:?}", e);
+                Err(e.into())
+            }
         }
     }
 
