@@ -1,24 +1,60 @@
-use crate::error::Error;
+use crate::{config, device::Device, error::Error, sensor::Sensor, Irqs, SoilSensorResources};
 
-use defmt::info;
 use embassy_rp::{
-    i2c::{Async, I2c},
+    i2c::{self, Async, I2c},
     peripherals::I2C1,
 };
 
-use core::result::Result;
+use core::{result::Result, u16};
 
-pub struct SoilSensor<'a> {
-    addr: u8,
-    i2c: &'a mut I2c<'a, I2C1, Async>,
+#[derive(defmt::Format)]
+pub struct Data {
+    pub temp: f32,
+    pub mois: u16,
 }
 
-impl<'a> SoilSensor<'a> {
-    pub fn new(addr: u8, i2c_bus: &'a mut I2c<'a, I2C1, Async>) -> Self {
-        Self { addr, i2c: i2c_bus }
+impl From<Data> for [u8; 8] {
+    fn from(val: Data) -> Self {
+        let temp_scl = (val.temp * 10.0) as i16;
+        [
+            0x02,                  // channel    - 2 [soil_sensor]
+            0x67,                  // type       - temperature [2 bytes]
+            (temp_scl >> 8) as u8, //            - first byte
+            temp_scl as u8,        //            - second byte
+            0x02,                  // channel    - 2 [soil_sensor]
+            0x65,                  // type       - illuminance [2 bytes]
+            (val.mois >> 8) as u8, //            - first byte
+            val.mois as u8,        //            - second byte
+        ]
+    }
+}
+
+#[derive(defmt::Format)]
+pub struct Info {
+    pub hw_id: u8,
+    pub product_code: u16,
+    pub year: u8,
+    pub month: u8,
+    pub day: u8,
+}
+
+pub struct SoilSensor {
+    addr: u8,
+    bus: I2c<'static, I2C1, Async>,
+}
+
+impl Device<SoilSensorResources> for SoilSensor {
+    type Info = Info;
+    async fn prepare(r: SoilSensorResources) -> Result<Self, Error> {
+        let i2c_1_bus = I2c::new_async(r.i2c1, r.pin_19, r.pin_18, Irqs, i2c::Config::default());
+
+        Ok(SoilSensor {
+            addr: config::Config::I2C_ADDR_SOIL_SENSOR,
+            bus: i2c_1_bus,
+        })
     }
 
-    pub async fn init(&mut self) -> Result<u16, Error> {
+    async fn init(&mut self) -> Result<Self::Info, Error> {
         let hw_id = self.get_hw_id().await?;
         let status = self.get_status().await?;
         let product_code: u16 = (status >> 16) as u16;
@@ -26,24 +62,27 @@ impl<'a> SoilSensor<'a> {
         let month: u8 = ((status >> 7) & 0xf) as u8;
         let day: u8 = ((status >> 11) & 0x1f) as u8;
 
-        info!(
-            "Soil Sensor [ATSAMD09]
-            - hardware id code {:?}
-            - product code {:?}
-            - manufactoring year {:?} month {:?} day {:?}",
-            hw_id, product_code, year, month, day
-        );
-
-        Ok(product_code)
+        Ok(Info {
+            hw_id,
+            product_code,
+            year,
+            month,
+            day,
+        })
     }
+}
 
-    pub async fn measure(&mut self) -> Result<(f32, u16), Error> {
-        let temperature = self.get_temperature().await?;
-        let moisture = self.get_moisture().await?;
+impl Sensor<Data> for SoilSensor {
+    async fn collect_data(&mut self) -> Result<Data, Error> {
+        let temp = self.get_temperature().await?;
+        let mois = self.get_moisture().await?;
+        let data = Data { temp, mois };
 
-        Ok((temperature, moisture))
+        Ok(data)
     }
+}
 
+impl SoilSensor {
     async fn get_temperature(&mut self) -> Result<f32, Error> {
         let mut buffer = [0u8; 4];
 
@@ -92,10 +131,10 @@ impl<'a> SoilSensor<'a> {
     }
 
     async fn write(&mut self, base_reg: u8, fn_reg: u8) -> Result<(), Error> {
-        self.i2c.write_async(self.addr, [base_reg, fn_reg]).await.map_err(|e| e.into())
+        self.bus.write_async(self.addr, [base_reg, fn_reg]).await.map_err(|e| e.into())
     }
 
     async fn read(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        self.i2c.read_async(self.addr, buffer).await.map_err(|e| e.into())
+        self.bus.read_async(self.addr, buffer).await.map_err(|e| e.into())
     }
 }

@@ -1,0 +1,28 @@
+[default.probe]
+protocol = "Swd"
+
+[default.flashing]
+enabled = true
+
+[default.reset]
+enabled = true
+halt_afterwards = false
+
+[default.general]
+chip = "RP2040"
+log_level = "ERROR"
+connect_under_reset = false
+
+[default.rtt]
+enabled = true
+up_channels = [
+    { channel = 0, mode = "NoBlockSkip", format = "Defmt", log_format = "{t:<13}{L} {s}" },
+]
+down_channels = []
+timeout = 3000
+log_enabled = true
+log_path = "./logs"
+
+[default.gdb]
+enabled = false
+gdb_connection_string = "127.0.0.1:2345"
