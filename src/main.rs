@@ -14,16 +14,15 @@ mod transceiver;
 
 use air_sensor::AirSensor;
 use assign_resources::assign_resources;
-use board::{Board, BoardBuilder};
+use board::BoardBuilder;
 use board_sensor::BoardSensor;
 use device::Device;
 use ekv::Database;
 use embassy_executor::Spawner;
 use embassy_rp::peripherals::{I2C0, I2C1};
 use embassy_rp::{bind_interrupts, peripherals};
-use embassy_time::{Duration, Ticker, Timer};
 use soil_sensor::SoilSensor;
-use transceiver::{RadioDevice, Transceiver};
+use transceiver::RadioDevice;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
@@ -67,14 +66,8 @@ assign_resources! {
     }
 }
 
-enum State {
-    Auth,
-    Run,
-    Sleep,
-}
-
 #[embassy_executor::main]
-async fn main(s: Spawner) {
+async fn main(_spawner: Spawner) {
     let peripherals = embassy_rp::init(Default::default());
     let res = split_resources! {peripherals};
     let board_sensor = BoardSensor::prepare(res.board).await.expect("board sensors should be functional");
@@ -82,7 +75,7 @@ async fn main(s: Spawner) {
     let soil_sensor = SoilSensor::prepare(res.soil).await.expect("soil sensor should be connected");
     let radio = RadioDevice::prepare(res.xcvr).await.expect("radio module should be connected");
     let database = Database::prepare(res.database).await.expect("flash memory should be connected");
-    let mut board = BoardBuilder::new()
+    let board = BoardBuilder::new()
         .with_board_sensor(board_sensor)
         .with_air_sensor(air_sensor)
         .with_soil_sensor(soil_sensor)
@@ -91,65 +84,5 @@ async fn main(s: Spawner) {
         .build()
         .expect("all devices should be connected");
 
-    if let Ok(()) = board.init().await {
-        s.spawn(orchestator(board)).expect("embassy executor should be available")
-    } else {
-        defmt::error!("Reseting device")
-    }
-}
-
-#[embassy_executor::task]
-async fn orchestator(mut board: Board) {
-    let mut ticker = Ticker::every(Duration::from_secs(30));
-    let mut state = State::Auth;
-    let mut auth_counter: u8 = 0;
-    loop {
-        state = match state {
-            State::Auth => {
-                defmt::info!("Entering authentication mode");
-
-                match board.join_otaa().await {
-                    Ok(()) => {
-                        board.initialize_uplink_frame_counter().await.expect("ez");
-                        board.initialize_downlink_frame_counter().await.expect("ez");
-                        State::Run
-                    }
-                    Err(_) => {
-                        if auth_counter >= 5 {
-                            State::Sleep
-                        } else {
-                            auth_counter += 1;
-                            State::Auth
-                        }
-                    }
-                }
-            }
-            State::Run => {
-                defmt::info!("Entering duty cycle mode");
-
-                if let Ok(data) = board.collect_data().await {
-                    match board.uplink(data.as_slice()).await {
-                        Ok(()) => {
-                            board.increment_uplink_frame_counter().await.expect("ez");
-                            board.increment_downlink_frame_counter().await.expect("ez");
-                            State::Run
-                        }
-                        Err(_) => State::Sleep,
-                    }
-                } else {
-                    State::Sleep
-                }
-            }
-            State::Sleep => {
-                defmt::info!("Entering sleep mode");
-
-                Timer::after_secs(60 * 10).await;
-
-                State::Auth
-            }
-        };
-
-        defmt::info!("Entering sleep mode untill next tick");
-        ticker.next().await;
-    }
+    board.run().await;
 }

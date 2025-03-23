@@ -25,34 +25,35 @@ pub struct DbFlash<T: NorFlash + ReadNorFlash> {
 pub type EkvDatabase = ekv::Database<DbFlash<Flash<'static, FLASH, Blocking, FLASH_SIZE>>, NoopRawMutex>;
 
 #[derive(defmt::Format)]
-pub enum Key {
-    UPLINK_FRAME_COUNTER,
-    DOWNLINK_FRAME_COUNTER,
+pub enum DbKey {
+    AppSKey,
+    NewSKey,
+    DevAddr,
 }
 
-impl From<&Key> for [u8; 1] {
-    fn from(value: &Key) -> Self {
+impl From<&DbKey> for [u8; 1] {
+    fn from(value: &DbKey) -> Self {
         match value {
-            Key::UPLINK_FRAME_COUNTER => [0x00],
-            Key::DOWNLINK_FRAME_COUNTER => [0x01],
+            DbKey::AppSKey => [0x00],
+            DbKey::NewSKey => [0x01],
+            DbKey::DevAddr => [0x02],
         }
     }
 }
 
 pub trait Database {
-    async fn put(&mut self, key: &Key, value: u16) -> Result<(), Error>;
-    async fn get(&mut self, key: &Key) -> Option<u16>;
+    async fn put(&mut self, key: &DbKey, val: &[u8]) -> Result<(), Error>;
+    async fn get(&mut self, key: &DbKey, buf: &mut [u8]) -> Option<usize>;
 }
 
 impl Database for EkvDatabase {
-    async fn put(&mut self, key: &Key, value: u16) -> Result<(), Error> {
-        defmt::info!("Writing key {:?} value {=u16} to flash", key, value);
+    async fn put(&mut self, key: &DbKey, value: &[u8]) -> Result<(), Error> {
+        defmt::info!("Writing key {:?} value {=[u8]:#x} to flash", key, value);
 
         let mut wtx = self.write_transaction().await;
         let key: [u8; 1] = key.into();
-        let value: [u8; 2] = value.to_be_bytes();
 
-        wtx.write(&key, &value).await.expect("should write");
+        wtx.write(&key, value).await.expect("should write");
         wtx.commit().await.expect("should commit");
 
         defmt::info!("Commited data to flash");
@@ -60,17 +61,15 @@ impl Database for EkvDatabase {
         Ok(())
     }
 
-    async fn get(&mut self, key: &Key) -> Option<u16> {
+    async fn get(&mut self, key: &DbKey, buf: &mut [u8]) -> Option<usize> {
         defmt::info!("Reading key {:?} from flash", key);
 
         let rtx = self.read_transaction().await;
         let key: [u8; 1] = key.into();
-        let mut buf: [u8; 2] = [0u8; 2];
 
-        rtx.read(&key, &mut buf)
+        rtx.read(&key, buf)
             .await
-            .map(|_| u16::from_be_bytes(buf))
-            .inspect(|d| defmt::info!("Successfully read data {=u16} from flash", d))
+            .inspect(|_| defmt::info!("Successfully read data {=[u8]:#x} from flash", buf))
             .ok()
     }
 }
@@ -93,6 +92,7 @@ impl Device<DatabaseResources> for EkvDatabase {
             defmt::info!("Formatting flash memory");
             self.format().await.unwrap();
         }
+
         Ok(())
     }
 }

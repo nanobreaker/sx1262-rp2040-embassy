@@ -14,10 +14,18 @@ pub struct BoardSensor {
 }
 
 #[derive(defmt::Format)]
+pub enum PowerSource {
+    Battery,
+    Usb,
+}
+
+#[derive(defmt::Format)]
 pub struct Data {
     pub temp: f32,
     pub btr_voltage: f32,
     pub btr_capacity: f32,
+    pub vsys_voltage: f32,
+    pub power_source: PowerSource,
 }
 
 impl From<Data> for [u8; 11] {
@@ -69,11 +77,15 @@ impl Sensor<Data> for BoardSensor {
     async fn collect_data(&mut self) -> Result<Data, Error> {
         let temp = self.get_temperature().await?;
         let (btr_voltage, btr_capacity) = self.get_battery_capacity().await?;
+        let power_source = self.get_power_source().await;
+        let vsys_voltage = self.get_vsys_voltage().await?;
 
         Ok(Data {
             temp,
             btr_voltage,
             btr_capacity,
+            vsys_voltage,
+            power_source,
         })
     }
 }
@@ -97,5 +109,19 @@ impl BoardSensor {
         let btr_capacity = percentage.clamp(0.0, 100.0);
 
         Ok((btr_voltage, btr_capacity))
+    }
+
+    async fn get_power_source(&mut self) -> PowerSource {
+        if self.usb_pwr.is_high() {
+            PowerSource::Usb
+        } else {
+            PowerSource::Battery
+        }
+    }
+
+    async fn get_vsys_voltage(&mut self) -> Result<f32, Error> {
+        let vsys_adc_raw = self.adc.read(&mut self.vsys_adc).await?;
+        let vsys_voltage = (vsys_adc_raw as f32) * 3.3 * 3.0 / 4096.0;
+        Ok(vsys_voltage)
     }
 }

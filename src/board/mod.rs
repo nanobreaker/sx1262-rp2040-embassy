@@ -1,69 +1,100 @@
-use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
+use embassy_time::{Duration, Ticker, Timer};
 use heapless::Vec;
-use lorawan_device::async_device::SendResponse;
-use static_cell::StaticCell;
+use lorawan_device::{async_device::SendResponse, AppSKey, DevAddr, NewSKey};
 
 use crate::{
     air_sensor::AirSensor,
     board_sensor::BoardSensor,
-    database::{Database, EkvDatabase},
+    database::{Database, DbKey, EkvDatabase},
     device::Device,
     error::Error,
     sensor::Sensor,
     soil_sensor::SoilSensor,
-    transceiver::{self, RadioDevice, Transceiver},
+    transceiver::{RadioDevice, Transceiver},
 };
 
-static BOARD_SENSOR_CELL: StaticCell<Mutex<ThreadModeRawMutex, BoardSensor>> = StaticCell::new();
-static AIR_SENSOR_CELL: StaticCell<Mutex<ThreadModeRawMutex, AirSensor>> = StaticCell::new();
-static SOIL_SENSOR_CELL: StaticCell<Mutex<ThreadModeRawMutex, SoilSensor>> = StaticCell::new();
-static RADIO_CELL: StaticCell<Mutex<ThreadModeRawMutex, RadioDevice>> = StaticCell::new();
-
-pub struct Board {
-    pub board_sensor: &'static mut Mutex<ThreadModeRawMutex, BoardSensor>,
-    pub air_sensor: &'static mut Mutex<ThreadModeRawMutex, AirSensor>,
-    pub soil_sensor: &'static mut Mutex<ThreadModeRawMutex, SoilSensor>,
-    pub transceiver: &'static mut Mutex<ThreadModeRawMutex, RadioDevice>,
-    pub database: EkvDatabase,
+enum State {
+    Init,
+    Auth,
+    Duty,
+    Send,
+    Wait(u64),
 }
 
-pub struct BoardBuilder {
-    board_sensor: Option<BoardSensor>,
-    air_sensor: Option<AirSensor>,
-    soil_sensor: Option<SoilSensor>,
-    radio: Option<RadioDevice>,
-    database: Option<EkvDatabase>,
+pub struct Board {
+    state: State,
+
+    board_sensor: BoardSensor,
+    air_sensor: AirSensor,
+    soil_sensor: SoilSensor,
+    transceiver: RadioDevice,
+    database: EkvDatabase,
+
+    sensors_data: Vec<u8, 30>,
+    join_attempt: u8,
+    reset: bool,
 }
 
 impl Board {
+    pub async fn run(mut self) {
+        let mut ticker = Ticker::every(Duration::from_secs(30));
+        loop {
+            self.state = match self.state {
+                State::Init => match self.init().await {
+                    Ok(()) => State::Auth,
+                    Err(_) => State::Wait(60 * 10),
+                },
+                State::Auth => match self.auth().await {
+                    Ok(()) => State::Duty,
+                    Err(Error::JoinLimitReached) => State::Wait(60 * 60),
+                    Err(_) => State::Wait(60 * 10),
+                },
+                State::Duty => match self.collect_data().await {
+                    Ok(()) => State::Send,
+                    Err(_) => State::Wait(60 * 10),
+                },
+                State::Send => match self.uplink().await {
+                    Ok(()) => State::Duty,
+                    Err(Error::JoinSessionExpired) => State::Auth,
+                    Err(_) => State::Wait(60 * 10),
+                },
+                State::Wait(secs) => {
+                    Timer::after_secs(secs).await;
+                    State::Init
+                }
+            };
+            ticker.next().await;
+        }
+    }
+
     pub async fn init(&mut self) -> Result<(), Error> {
-        let mut board_sensor = self.board_sensor.lock().await;
-        let mut air_sensor = self.air_sensor.lock().await;
-        let mut soil_sensor = self.soil_sensor.lock().await;
-        let mut transceiver = self.transceiver.lock().await;
         let mut errors = Vec::<Error, 4>::new();
 
         defmt::info!("Initializing board");
 
-        let _ = board_sensor
+        let _ = self
+            .board_sensor
             .init()
             .await
             .inspect(|i| defmt::info!("Initialized board sensor {:?}", i))
             .map_err(|e| errors.push(e));
 
-        let _ = air_sensor
+        let _ = self
+            .air_sensor
             .init()
             .await
             .inspect(|i| defmt::info!("Initialized air sensor {:?}", i))
             .map_err(|e| errors.push(e));
 
-        let _ = soil_sensor
+        let _ = self
+            .soil_sensor
             .init()
             .await
             .inspect(|i| defmt::info!("Initialized soil sensor {:?}", i))
             .map_err(|e| errors.push(e));
 
-        let _ = transceiver
+        let _ = self
+            .transceiver
             .init()
             .await
             .inspect(|i| defmt::info!("Initialized transceiver {:?}", i))
@@ -76,6 +107,10 @@ impl Board {
             .inspect(|i| defmt::info!("Initialized flash memory {:?}", i))
             .map_err(|e| errors.push(e));
 
+        if self.reset {
+            return self.database.format().await.map_err(Error::Flash);
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -83,107 +118,158 @@ impl Board {
             for error in errors {
                 defmt::error!("{:?}", error);
             }
-            Err(Error::FailedToInitialize)
+            Err(Error::Init)
         }
     }
 
-    pub async fn join_otaa(&mut self) -> Result<(), Error> {
-        let mut transceiver = self.transceiver.lock().await;
+    pub async fn auth(&mut self) -> Result<(), Error> {
+        defmt::info!("Verifying if device was already authenticated");
 
-        transceiver.join_otaa().await
-    }
+        if let Some(keys) = self.get_session_keys().await {
+            defmt::info!("Device is already authenticated");
 
-    pub async fn initialize_uplink_frame_counter(&mut self) -> Result<(), Error> {
-        if let None = self.database.get(&crate::database::Key::UPLINK_FRAME_COUNTER).await {
-            self.database.put(&crate::database::Key::UPLINK_FRAME_COUNTER, 0).await
+            match self.transceiver.join_abp(keys).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    defmt::info!("Failed to join lorawan network {:?}", e);
+
+                    Err(Error::JoinFailed)
+                }
+            }
         } else {
-            Ok(())
+            defmt::info!("Authenticating device");
+
+            match self.transceiver.join_otaa().await {
+                Ok((news_key, apps_key, dev_addr)) => {
+                    defmt::info!("Joined lorawan network");
+
+                    self.persist_session_keys((news_key, apps_key, dev_addr)).await?;
+                    Ok(())
+                }
+                Err(e) => {
+                    defmt::info!("Failed to join lorawan network {:?}", e);
+
+                    if self.join_attempt > 9 {
+                        self.join_attempt = 0;
+                        Err(Error::JoinLimitReached)
+                    } else {
+                        self.join_attempt += 1;
+                        Err(Error::JoinFailed)
+                    }
+                }
+            }
         }
     }
 
-    pub async fn initialize_downlink_frame_counter(&mut self) -> Result<(), Error> {
-        if let None = self.database.get(&crate::database::Key::DOWNLINK_FRAME_COUNTER).await {
-            self.database.put(&crate::database::Key::DOWNLINK_FRAME_COUNTER, 0).await
+    async fn get_session_keys(&mut self) -> Option<(lorawan_device::NewSKey, lorawan_device::AppSKey, lorawan_device::DevAddr<[u8; 4]>)> {
+        defmt::info!("Reading keys");
+
+        let mut apps_key_buf = [0u8; 16];
+        let apps_key = self
+            .database
+            .get(&DbKey::AppSKey, &mut apps_key_buf)
+            .await
+            .map(|_size| AppSKey::from(apps_key_buf));
+
+        let mut news_key_buf = [0u8; 16];
+        let news_key = self
+            .database
+            .get(&DbKey::NewSKey, &mut news_key_buf)
+            .await
+            .map(|_size| NewSKey::from(news_key_buf));
+
+        let mut dev_addr_buf = [0u8; 4];
+        let dev_addr = self
+            .database
+            .get(&DbKey::DevAddr, &mut dev_addr_buf)
+            .await
+            .map(|_size| DevAddr::from(dev_addr_buf));
+
+        if let (Some(news_key), Some(apps_key), Some(dev_addr)) = (news_key, apps_key, dev_addr) {
+            Some((news_key, apps_key, dev_addr))
         } else {
-            Ok(())
+            None
         }
     }
 
-    pub async fn increment_uplink_frame_counter(&mut self) -> Result<(), Error> {
-        if let Some(mut counter) = self.database.get(&crate::database::Key::UPLINK_FRAME_COUNTER).await {
-            counter += 1;
-            self.database.put(&crate::database::Key::UPLINK_FRAME_COUNTER, counter).await
-        } else {
-            Err(Error::FailedToInitialize)
-        }
+    async fn persist_session_keys(
+        &mut self,
+        keys: (lorawan_device::NewSKey, lorawan_device::AppSKey, lorawan_device::DevAddr<[u8; 4]>),
+    ) -> Result<(), Error> {
+        defmt::info!("Persisting keys");
+
+        let news_key = keys.0.as_ref();
+        defmt::info!("NewSKey {=[u8]}", news_key);
+        self.database.put(&DbKey::NewSKey, news_key).await?;
+
+        let apps_key = keys.1.as_ref();
+        defmt::info!("AppSKey {=[u8]}", apps_key);
+        self.database.put(&DbKey::AppSKey, apps_key).await?;
+
+        let dev_addr = keys.2.as_ref();
+        defmt::info!("DevAddr {=[u8]}", dev_addr);
+        self.database.put(&DbKey::DevAddr, dev_addr).await?;
+
+        Ok(())
     }
 
-    pub async fn increment_downlink_frame_counter(&mut self) -> Result<(), Error> {
-        if let Some(mut counter) = self.database.get(&crate::database::Key::DOWNLINK_FRAME_COUNTER).await {
-            counter += 1;
-            self.database.put(&crate::database::Key::DOWNLINK_FRAME_COUNTER, counter).await
-        } else {
-            Err(Error::FailedToInitialize)
-        }
-    }
-
-    pub async fn collect_data(&mut self) -> Result<Vec<u8, 30>, Error> {
-        let mut board_sensor = self.board_sensor.lock().await;
-        let mut air_sensor = self.air_sensor.lock().await;
-        let mut soil_sensor = self.soil_sensor.lock().await;
-        let mut payload = Vec::<u8, 30>::new();
+    pub async fn collect_data(&mut self) -> Result<(), Error> {
         let mut errors = Vec::<Error, 4>::new();
+        self.sensors_data.clear();
 
         defmt::info!("Collecting data from sensors");
 
-        let _ = board_sensor
+        let _ = self
+            .board_sensor
             .collect_data()
             .await
             .inspect(|d| defmt::info!("Board {:?}", d))
             .map(|d| {
                 let bytes: [u8; 11] = d.into();
-                payload.extend_from_slice(&bytes).expect("should extend");
+                self.sensors_data.extend_from_slice(&bytes).expect("should extend");
             })
             .map_err(|e| errors.push(e));
 
-        let _ = air_sensor
+        let _ = self
+            .air_sensor
             .collect_data()
             .await
             .inspect(|d| defmt::info!("Air {:?}", d))
             .map(|d| {
                 let bytes: [u8; 11] = d.into();
-                payload.extend_from_slice(&bytes).expect("should extend");
+                self.sensors_data.extend_from_slice(&bytes).expect("should extend");
             })
             .map_err(|e| errors.push(e));
 
-        let _ = soil_sensor
+        let _ = self
+            .soil_sensor
             .collect_data()
             .await
             .inspect(|d| defmt::info!("Soil {:?}", d))
             .map(|d| {
                 let bytes: [u8; 8] = d.into();
-                payload.extend_from_slice(&bytes).expect("should extend");
+                self.sensors_data.extend_from_slice(&bytes).expect("should extend");
             })
             .map_err(|e| errors.push(e));
 
         if errors.is_empty() {
-            Ok(payload)
+            Ok(())
         } else {
             defmt::error!("Error(s) during data collection");
             for error in errors {
                 defmt::error!("{:?}", error);
             }
-            Err(Error::FailedToCollectData)
+            Err(Error::Duty)
         }
     }
 
-    pub async fn uplink(&mut self, data: &[u8]) -> Result<(), Error> {
-        let mut transceiver = self.transceiver.lock().await;
+    pub async fn uplink(&mut self) -> Result<(), Error> {
+        let data: &[u8] = self.sensors_data.as_ref();
 
         defmt::info!("Sending uplink message");
-        defmt::info!("Payload {=[u8]:x}", data);
+        defmt::info!("Payload {=[u8]:#x}", data);
 
-        match transceiver.uplink(data).await {
+        match self.transceiver.uplink(data).await {
             Ok(SendResponse::DownlinkReceived(f_count)) => {
                 defmt::info!("Sent uplink, received downlink with fcount {=u32}", f_count);
                 Ok(())
@@ -193,12 +279,12 @@ impl Board {
                 Ok(())
             }
             Ok(SendResponse::RxComplete) => {
-                defmt::info!(" and acknowledged by the gateway");
+                defmt::info!("RxComplete");
                 Ok(())
             }
             Ok(SendResponse::SessionExpired) => {
                 defmt::error!("Failed to send uplink, session expired");
-                Err(Error::LoraRadio)
+                Err(Error::JoinSessionExpired)
             }
             Err(e) => {
                 defmt::error!("Failed to send uplink message: {:?}", e);
@@ -206,6 +292,14 @@ impl Board {
             }
         }
     }
+}
+
+pub struct BoardBuilder {
+    board_sensor: Option<BoardSensor>,
+    air_sensor: Option<AirSensor>,
+    soil_sensor: Option<SoilSensor>,
+    radio: Option<RadioDevice>,
+    database: Option<EkvDatabase>,
 }
 
 impl BoardBuilder {
@@ -245,23 +339,22 @@ impl BoardBuilder {
     }
 
     pub fn build(self) -> Result<Board, crate::error::Error> {
-        if let (Some(board_sensor), Some(air_sensor), Some(soil_sensor), Some(radio), Some(database)) =
+        if let (Some(board_sensor), Some(air_sensor), Some(soil_sensor), Some(transceiver), Some(database)) =
             (self.board_sensor, self.air_sensor, self.soil_sensor, self.radio, self.database)
         {
-            let board_sensor_ref = BOARD_SENSOR_CELL.init(Mutex::new(board_sensor));
-            let air_sensor_ref = AIR_SENSOR_CELL.init(Mutex::new(air_sensor));
-            let soil_sensor_ref = SOIL_SENSOR_CELL.init(Mutex::new(soil_sensor));
-            let radio_ref = RADIO_CELL.init(Mutex::new(radio));
-
             Ok(Board {
-                board_sensor: board_sensor_ref,
-                air_sensor: air_sensor_ref,
-                soil_sensor: soil_sensor_ref,
-                transceiver: radio_ref,
+                state: State::Init,
+                board_sensor,
+                air_sensor,
+                soil_sensor,
+                transceiver,
                 database,
+                sensors_data: Vec::<u8, 30>::new(),
+                join_attempt: 0,
+                reset: false,
             })
         } else {
-            Err(Error::FailedToInitialize)
+            Err(Error::Init)
         }
     }
 }

@@ -14,7 +14,7 @@ use lora_phy::{
 };
 use lorawan_device::{
     async_device::{self, EmbassyTimer},
-    region, AppEui, AppKey, DevEui, JoinMode,
+    region, AppEui, AppKey, AppSKey, DevAddr, DevEui, JoinMode, NewSKey,
 };
 use lorawan_device::{
     async_device::{JoinResponse, SendResponse},
@@ -36,35 +36,41 @@ type Sx1262Radio = LorawanRadio<
 pub(crate) type RadioDevice = lorawan_device::async_device::Device<Sx1262Radio, Crypto, EmbassyTimer, RoscRng>;
 
 pub trait Transceiver {
-    async fn join_otaa(&mut self) -> Result<(), Error>;
+    async fn join_otaa(&mut self) -> Result<(NewSKey, AppSKey, DevAddr<[u8; 4]>), Error>;
+    async fn join_abp(&mut self, keys: (NewSKey, AppSKey, DevAddr<[u8; 4]>)) -> Result<(), Error>;
     async fn uplink(&mut self, payload: &[u8]) -> Result<SendResponse, Error>;
 }
 
 impl Transceiver for RadioDevice {
-    async fn join_otaa(&mut self) -> Result<(), Error> {
-        defmt::info!("Joining lorawan network");
-
-        let response = self
+    async fn join_otaa(&mut self) -> Result<(NewSKey, AppSKey, DevAddr<[u8; 4]>), Error> {
+        match self
             .join(&JoinMode::OTAA {
                 deveui: DevEui::from(config::Config::DEV_EUI),
                 appeui: AppEui::from(config::Config::APP_EUI),
                 appkey: AppKey::from(config::Config::APP_KEY),
             })
-            .await;
-
-        match response {
+            .await
+        {
             Ok(JoinResponse::JoinSuccess) => {
-                defmt::info!("Joined lorawan network");
-                Ok(())
+                let session = self.get_session().unwrap();
+                Ok((session.nwkskey, session.appskey, session.devaddr))
             }
-            Ok(JoinResponse::NoJoinAccept) => {
-                defmt::warn!("Failed to join lorawan network, no join accept received");
-                Err(Error::LoraRadio)
-            }
-            Err(e) => {
-                defmt::info!("Failed to join lorawan network {:?}", e);
-                Err(e.into())
-            }
+            Ok(JoinResponse::NoJoinAccept) => Err(Error::JoinAcceptMissing),
+            Err(e) => Err(Error::LoRaWAN(e)),
+        }
+    }
+
+    async fn join_abp(&mut self, keys: (NewSKey, AppSKey, DevAddr<[u8; 4]>)) -> Result<(), Error> {
+        match self
+            .join(&JoinMode::ABP {
+                nwkskey: keys.0,
+                appskey: keys.1,
+                devaddr: keys.2,
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Error::LoRaWAN(e)),
         }
     }
 

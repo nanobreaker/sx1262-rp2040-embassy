@@ -5,7 +5,7 @@ use embassy_rp::{
     peripherals::I2C1,
 };
 
-use core::{result::Result, u16};
+use core::result::Result;
 
 #[derive(defmt::Format)]
 pub struct Data {
