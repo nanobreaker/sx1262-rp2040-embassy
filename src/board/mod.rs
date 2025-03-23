@@ -30,7 +30,7 @@ pub struct Board {
     transceiver: RadioDevice,
     database: EkvDatabase,
 
-    sensors_data: Vec<u8, 30>,
+    sensors_data: Vec<u8, 37>,
     join_attempt: u8,
     reset: bool,
 }
@@ -225,7 +225,7 @@ impl Board {
             .await
             .inspect(|d| defmt::info!("Board {:?}", d))
             .map(|d| {
-                let bytes: [u8; 11] = d.into();
+                let bytes: [u8; 18] = d.into();
                 self.sensors_data.extend_from_slice(&bytes).expect("should extend");
             })
             .map_err(|e| errors.push(e));
@@ -349,7 +349,7 @@ impl BoardBuilder {
                 soil_sensor,
                 transceiver,
                 database,
-                sensors_data: Vec::<u8, 30>::new(),
+                sensors_data: Vec::<u8, 37>::new(),
                 join_attempt: 0,
                 reset: false,
             })

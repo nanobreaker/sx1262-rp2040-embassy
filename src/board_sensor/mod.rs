@@ -19,6 +19,15 @@ pub enum PowerSource {
     Usb,
 }
 
+impl From<PowerSource> for u8 {
+    fn from(value: PowerSource) -> Self {
+        match value {
+            PowerSource::Battery => 0,
+            PowerSource::Usb => 1,
+        }
+    }
+}
+
 #[derive(defmt::Format)]
 pub struct Data {
     pub temp: f32,
@@ -28,23 +37,31 @@ pub struct Data {
     pub power_source: PowerSource,
 }
 
-impl From<Data> for [u8; 11] {
+impl From<Data> for [u8; 18] {
     fn from(value: Data) -> Self {
         let temp_scl = (value.temp * 10.0) as u16;
         let btr_voltage_scl = (value.btr_voltage * 100.0) as u16;
         let btr_capacity_scl = (value.btr_capacity * 2.0) as u8;
+        let vsys_voltage_scl = (value.vsys_voltage * 100.0) as u16;
         [
-            0x03,                         // channel    - 3 [rp2040]
-            0x67,                         // type       - temperature [2 bytes]
-            (temp_scl >> 8) as u8,        //            - first byte
-            temp_scl as u8,               //            - second byte
-            0x03,                         // channel    - 3 [rp2040]
-            0x02,                         // type       - analog input [2 bytes]
-            (btr_voltage_scl >> 8) as u8, //            - first byte
-            btr_voltage_scl as u8,        //            - second byte
-            0x03,                         // channel    - 3 [rp2040]
-            0x68,                         // type       - humidity [1 bytes]
-            btr_capacity_scl,             //            - first byte
+            0x03,                          // channel    - 3 [rp2040]
+            0x67,                          // type       - temperature [2 bytes]
+            (temp_scl >> 8) as u8,         //            - first byte
+            temp_scl as u8,                //            - second byte
+            0x03,                          // channel    - 3 [rp2040]
+            0x02,                          // type       - analog input [2 bytes]
+            (btr_voltage_scl >> 8) as u8,  //            - first byte
+            btr_voltage_scl as u8,         //            - second byte
+            0x03,                          // channel    - 3 [rp2040]
+            0x68,                          // type       - humidity [1 bytes]
+            btr_capacity_scl,              //            - first byte
+            0x04,                          // channel    - 3 [rp2040]
+            0x02,                          // type       - analog input [2 bytes]
+            (vsys_voltage_scl >> 8) as u8, //            - first byte
+            vsys_voltage_scl as u8,        //            - second byte
+            0x04,                          // channel    - 3 [rp2040]
+            0x00,                          // type       - diginal input [1 bytes]
+            value.power_source as u8,      //            - first byte
         ]
     }
 }
