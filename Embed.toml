@@ -10,18 +10,16 @@ halt_afterwards = false
 
 [default.general]
 chip = "RP2040"
-log_level = "ERROR"
 connect_under_reset = false
+log_level = "ERROR"
 
 [default.rtt]
-enabled = true
-up_channels = [
-    { channel = 0, mode = "NoBlockSkip", format = "Defmt", log_format = "{t:<13}{L} {s}" },
-]
 down_channels = []
-timeout = 3000
+enabled = true
 log_enabled = true
 log_path = "./logs"
+timeout = 3000
+up_channels = [{ channel = 0, mode = "NoBlockSkip", format = "Defmt", log_format = "{t:<13}{L} {s}" }]
 
 [default.gdb]
 enabled = false

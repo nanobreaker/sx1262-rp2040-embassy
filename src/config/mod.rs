@@ -4,7 +4,6 @@ pub struct Config;
 
 impl Config {
     pub const I2C_ADDR_AIR_SENSOR: u16 = 0x62;
-    pub const I2C_ADDR_SOIL_SENSOR: u8 = 0x36;
 
     pub const DEV_EUI: [u8; 8] = [0xd5, 0x2e, 0x0f, 0x9f, 0xf9, 0x9f, 0x7b, 0x58];
     pub const APP_EUI: [u8; 8] = [0xda, 0x51, 0x8e, 0xd0, 0x28, 0x22, 0xb6, 0x34];
@@ -15,4 +14,5 @@ impl Config {
     pub const LORAWAN_REGION: region::Region = region::Region::EU868;
     pub const RX_WINDOW_LEAD_TIME: u32 = 1000; // default is 50
     pub const RX_WINDOW_BUFFER: u32 = 1000; // defautl is 50
+    pub const RESET: bool = false;
 }
