@@ -1,43 +1,61 @@
 # Preview
 
 ![preview_0](screenshot-0.png)
+![preview_1](screenshot-1.png)
 
 # Overview
 
-This project implements a LoRaWAN sensor node using the SX1262 transceiver and RP2040 microcontroller, leveraging the Embassy framework for efficient, asynchronous embedded programming.
+This is a POC project that implements a LoRaWAN sensor node using the SX1262 transceiver and RP2040 microcontroller, leveraging the Embassy framework for efficient, asynchronous embedded programming.
 The node collects data from air (temperature, humidity, CO2) and soil (temperature, moisture) sensors, encodes and transmits it over LoRaWAN.
 
 # Prerequisites
-- Raspberry Pi Pico (RP2040-based board)
-- SX1262 LoRa module
-- I2C sensors for air and soil data
-- Rust toolchain with `thumbv6m-none-eabi` target
-- `probe-rs` for flashing and debugging
-- LoRaWAN network server (e.g., ChirpStack) for gateway and device management
+
+## Raspberry Pi Pico
+Main board to run the project and orchestrate devices
+
+## Raspberry Pi Debug Probe
+Debug probe to ease deployment process and give you logs via defmt crate
+
+## SX1262 LoRa Node Module
+Transciever that supports LoRa modulation
+
+## Embedded Toolkit (probe-rs)
+Toolkit to let you programm pico via debug probe
+
+## LoRaWAN Gateway
+Gateway which recieves uplink messages from devices as ours
+
+## LoRaWAN Network Server
+Network server that processes uplink messages and acts as authentication server
+
+## Rust toolchain with thumbv6m-none-eabi support
+See rust-toolchain.toml
 
 # Getting Started
 
-## Installation
-1. Clone the repository:
-  ```bash
+## Install
+  ```shell
   git clone https://github.com/nanobreaker/sx1262-rp2040-embassy.git
-  cd sx1262-rp2040-embassy
   ```
-2. Set up the Rust environment:
-  ```bash
-  rustup target add thumbv6m-none-eabi
-  ```
-3. Build the project:
-  ```bash
+
+## Build
+  ```shell
   cargo build
   ```
 
-## Usage
-1. **Configure Sensors**: Update `config.rs` with your I2C addresses and LoRaWAN credentials.
-2. **Run the Application**: After flashing, the device will automatically start collecting sensor data and sending uplinks over LoRaWAN.
-   ```bash
-   cargo embed
-   ```
+## Deploy
+  ```shell
+  cargo embed
+  ```
+
+## Wiring
+
+<div style="margin-top: 2rem" align="center">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="wiring-dark.png">
+      <img alt="demo" src="wiring-light.png">
+    </picture>
+</div>
 
 ## Project Structure
 
@@ -57,7 +75,6 @@ The node collects data from air (temperature, humidity, CO2) and soil (temperatu
 - config
   - mod.rs
 - main.rs
-- error.rs
 
 # License
 
