@@ -28,15 +28,6 @@ pub enum PowerSource {
     Usb,
 }
 
-impl From<PowerSource> for u8 {
-    fn from(value: PowerSource) -> Self {
-        match value {
-            PowerSource::Battery => 0,
-            PowerSource::Usb => 1,
-        }
-    }
-}
-
 impl SystemSensor {
     pub fn new(r: SystemRes) -> Self {
         let temp_adc = adc::Channel::new_temp_sensor(r.adc_tmp);
@@ -118,8 +109,11 @@ impl Sensor<18> for SystemSensor {
     async fn probe(&mut self, adc: &mut adc::Adc<'static, adc::Async>) -> Result<[u8; 18], Self::Error> {
         let temp = self.get_temperature(adc).await?;
         let (btr_voltage, btr_capacity) = self.get_battery_capacity(adc).await?;
-        let power_source = self.get_power_source();
         let vsys_voltage = self.get_vsys_voltage(adc).await?;
+        let power_source = match self.get_power_source() {
+            PowerSource::Battery => 0,
+            PowerSource::Usb => 1,
+        };
 
         let temp_scl = (temp * 10.0) as u16;
         let btr_voltage_scl = (btr_voltage * 100.0) as u16;
@@ -127,11 +121,12 @@ impl Sensor<18> for SystemSensor {
         let vsys_voltage_scl = (vsys_voltage * 100.0) as u16;
 
         defmt::info!(
-            "System sensor data - tmp {=f32}°C vbtr {=f32}V cbtr {=f32}% vsys {=f32}V",
+            "System sensor data - tmp {=f32}°C vbtr {=f32}V cbtr {=f32}% vsys {=f32}V pwr {=u8}",
             temp,
             btr_voltage,
             btr_capacity,
-            vsys_voltage
+            vsys_voltage,
+            power_source,
         );
 
         let mut buf = [0u8; 18];
@@ -152,7 +147,7 @@ impl Sensor<18> for SystemSensor {
         buf[14] = vsys_voltage_scl as u8; //            - second byte
         buf[15] = 0x04; // channel    - 3 [rp2040]
         buf[16] = 0x00; // type       - diginal input [1 bytes]
-        buf[17] = power_source as u8; //            - first byte
+        buf[17] = power_source; //            - first byte
 
         Ok(buf)
     }

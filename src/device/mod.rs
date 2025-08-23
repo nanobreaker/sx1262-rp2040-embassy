@@ -84,7 +84,7 @@ where
     }
 
     pub async fn run(mut self) {
-        let mut ticker = Ticker::every(Duration::from_secs(15));
+        let mut ticker = Ticker::every(Duration::from_secs(60 * 10));
         loop {
             self.state = match self.state {
                 State::Boot => match self.boot().await {
