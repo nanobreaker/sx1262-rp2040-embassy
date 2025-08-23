@@ -111,8 +111,8 @@ impl Sensor<18> for SystemSensor {
         let (btr_voltage, btr_capacity) = self.get_battery_capacity(adc).await?;
         let vsys_voltage = self.get_vsys_voltage(adc).await?;
         let power_source = match self.get_power_source() {
-            PowerSource::Battery => 0,
-            PowerSource::Usb => 1,
+            PowerSource::Battery => 0x00,
+            PowerSource::Usb => 0x01,
         };
 
         let temp_scl = (temp * 10.0) as u16;
